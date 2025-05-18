@@ -1,0 +1,3318 @@
+diff --color -ruN -w -B '--exclude-from=.diff-exclude' linux-5.10/Makefile AdaptMD-5.10/Makefile
+--- linux-5.10/Makefile	2020-12-13 22:41:30.000000000 +0000
++++ AdaptMD-5.10/Makefile	2025-03-23 07:54:48.597769472 +0000
+@@ -2,7 +2,7 @@
+ VERSION = 5
+ PATCHLEVEL = 10
+ SUBLEVEL = 0
+-EXTRAVERSION =
++EXTRAVERSION = AdaptMD-5.10
+ NAME = Kleptomaniac Octopus
+ 
+ # *DOCUMENTATION*
+diff --color -ruN -w -B '--exclude-from=.diff-exclude' linux-5.10/mm/ksm.c AdaptMD-5.10/mm/ksm.c
+--- linux-5.10/mm/ksm.c	2020-12-13 22:41:30.000000000 +0000
++++ AdaptMD-5.10/mm/ksm.c	2025-03-28 03:03:09.038735484 +0000
+@@ -42,12 +42,73 @@
+ #include <asm/tlbflush.h>
+ #include "internal.h"
+ 
++#include <linux/migrate.h>
++#include <linux/topology.h>
++#include <linux/cpumask.h>
++#include <linux/time.h>
++#include <linux/math64.h>
++#include <linux/vmalloc.h>
++#include <linux/spinlock_types.h>
++
++#include <linux/signal.h>
++#include <linux/syscalls.h>
++#include <linux/nodemask.h>
++#include <linux/mempolicy.h>
++#include <linux/sched.h>
++// #include <linux/cpuset.h>
++#include <linux/tick.h>
++#include <linux/kernel_stat.h>
++#include <linux/proc_fs.h>
++#include <linux/mm_inline.h>
++#include <asm/pgalloc.h>
++#include <linux/gfp.h>
++#include <linux/fdtable.h>
++#include <linux/dcache.h>
++#include <linux/kvm_host.h>
++
+ #ifdef CONFIG_NUMA
+ #define NUMA(x)		(x)
+-#define DO_NUMA(x)	do { (x); } while (0)
++#define DO_NUMA(x)                                                             \
++	do {                                                                   \
++		(x);                                                           \
++	} while (0)
+ #else
+ #define NUMA(x)		(0)
+-#define DO_NUMA(x)	do { } while (0)
++#define DO_NUMA(x)                                                             \
++	do {                                                                   \
++	} while (0)
++#endif
++#ifndef DEBUG_MODE
++#define DEBUG_MODE 1
++#endif
++#ifndef NUMA_NODE_NUM
++#define NUMA_NODE_NUM 16
++
++#define NUMA_2_NODE_BLOOM_SIZE 1 << 27 // 32*1024*256*8bit
++#define NUMA_4_NODE_BLOOM_SIZE 1 << 26 // 16*1024*256*8bit
++#define BITSPERWORD 32
++#define SHIFT 5
++#define MASK 0x1F
++static int *bitmap[NUMA_NODE_NUM]; // bitmap pointer for hotness-aware dedup
++// static int *bitmap1[NUMA_NODE_NUM];
++
++static void set_bitmap(int i, int arr[])
++{
++	arr[i >> SHIFT] |= (1 << (i & MASK));
++}
++static int test_bitmap(int i, int arr[])
++{
++	return arr[i >> SHIFT] & (1 << (i & MASK));
++}
++
++static void reset_bitmap(int *array[], int size)
++{
++	int i;
++	for (i = 0; i < nr_node_ids; i++) {
++		memset(array[i], 0, (1 + size / BITSPERWORD) * sizeof(int));
++	}
++}
++
+ #endif
+ 
+ /**
+@@ -122,6 +183,10 @@
+ 	struct list_head mm_list;
+ 	struct rmap_item *rmap_list;
+ 	struct mm_struct *mm;
++#ifdef CONFIG_NUMA
++	unsigned int total_rmap_items; // the number of pages of this mm_slot
++	int node_id; // NUMA node id of this mm_slot
++#endif
+ };
+ 
+ /**
+@@ -140,6 +205,12 @@
+ 	unsigned long seqnr;
+ };
+ 
++struct migrate_bloom_info {
++	struct mm_slot *mm_slot;
++	int node_id;
++	unsigned int *bloom_array;
++	struct list_head list;
++};
+ /**
+  * struct stable_node - node of the stable rbtree
+  * @node: rb node of this ksm page in the stable tree
+@@ -210,6 +281,7 @@
+ 			struct hlist_node hlist;
+ 		};
+ 	};
++	char active; // the hotness of this rmap_item
+ };
+ 
+ #define SEQNR_MASK	0x0ff	/* low bits of unstable tree seqnr */
+@@ -267,7 +339,8 @@
+ static int ksm_max_page_sharing = 256;
+ 
+ /* Number of pages ksmd should scan in one batch */
+-static unsigned int ksm_thread_pages_to_scan = 100;
++static unsigned int ksm_thread_pages_to_scan = 10000;
++static unsigned int ksm_adaptive_dedup = 0;
+ 
+ /* Milliseconds ksmd should sleep between batches */
+ static unsigned int ksm_thread_sleep_millisecs = 20;
+@@ -279,11 +352,58 @@
+ static bool ksm_use_zero_pages __read_mostly;
+ 
+ #ifdef CONFIG_NUMA
++
++/* Milliseconds ksmd should sleep between batches */
++static unsigned long cold_page_numbers = 0;
++static unsigned long hot_page_numbers = 0;
++static unsigned long non_cold_page_numbers = 0;
++static unsigned long hotness_successful = 0;
++static unsigned long exist_numbers = 0;
++static unsigned long none_exist_numbers = 0;
++static int global_user_merge_across_nodes = 0;
++/* Internal flags */
++#define MPOL_MF_DISCONTIG_OK                                                   \
++	(MPOL_MF_INTERNAL << 0) /* Skip checks for continuous vmas */
++#define MPOL_MF_INVERT (MPOL_MF_INTERNAL << 1) /* Invert check for nodemask */
++// ctl_flag is used to choice different deduplication strategies
++// 0x0000 (0): default value, it means that bloom arrays for hotness-aware dedup are not constructed.
++// 0x1001 (9): bloom arrays for hotness-aware dedup have been create.
++// 0x11__: hotness-aware dedup is disabled.
++static int ctl_flag = 0;
++static int active_threshold = 1; // the threshold of hotness-aware dedup
++static int similarity_threshold =
++	400; // the threshold of similarity-based dedup
++
++// How many scans need to be spaced before the VM migration policy is executed
++static unsigned int ksm_migrate_vms_interval = 5;
++// How many scans need to be spaced before the adaptive migration policy is executed
++static unsigned int ksm_adaptive_interval = 5;
++
++// use bloom filter or not when performing hotness-aware dedup. 1 means using bloom filter
++static int use_bloom_filter = 1;
++
++// second-level hashing for the page content. 0 is not hash page content
++// static int hash_page_contend = 0;
++static int use_one_hash = 0; // just one hash function for hotness-aware dedup
++
++// When the memory/CPU usage of a NUMA node exceeds this value,
++// it means that the NUMA node is overloaded with CPU/memory
++// static u32 node_mem_overload_threshold = 90;
++static u32 node_cpus_overload_threshold = 90;
++
++// Record the (total and idle) CPU load of each NUMA node in the system.
++static u64 node_cpu_load_info[MAX_NUMNODES][2] = { 0 };
++
++static struct kmem_cache *migrate_bloom_info_cache;
++
++// Used to link struct migrate_bloom_info
++struct list_head *bloom_list[NUMA_NODE_NUM];
++
+ /* Zeroed when merging across nodes is not allowed */
+-static unsigned int ksm_merge_across_nodes = 1;
++static unsigned int ksm_merge_across_nodes = 0;
+ static int ksm_nr_node_ids = 1;
+ #else
+-#define ksm_merge_across_nodes	1U
++#define ksm_merge_across_nodes 0U
+ #define ksm_nr_node_ids		1
+ #endif
+ 
+@@ -299,9 +419,9 @@
+ static DEFINE_MUTEX(ksm_thread_mutex);
+ static DEFINE_SPINLOCK(ksm_mmlist_lock);
+ 
+-#define KSM_KMEM_CACHE(__struct, __flags) kmem_cache_create("ksm_"#__struct,\
+-		sizeof(struct __struct), __alignof__(struct __struct),\
+-		(__flags), NULL)
++#define KSM_KMEM_CACHE(__struct, __flags)                                      \
++	kmem_cache_create("ksm_" #__struct, sizeof(struct __struct),           \
++			  __alignof__(struct __struct), (__flags), NULL)
+ 
+ static int __init ksm_slab_init(void)
+ {
+@@ -317,8 +437,13 @@
+ 	if (!mm_slot_cache)
+ 		goto out_free2;
+ 
+-	return 0;
++	migrate_bloom_info_cache = KSM_KMEM_CACHE(migrate_bloom_info, 0);
++	if (!migrate_bloom_info_cache)
++		goto out_free4;
+ 
++	return 0;
++out_free4:
++	kmem_cache_destroy(migrate_bloom_info_cache);
+ out_free2:
+ 	kmem_cache_destroy(stable_node_cache);
+ out_free1:
+@@ -332,6 +457,7 @@
+ 	kmem_cache_destroy(mm_slot_cache);
+ 	kmem_cache_destroy(stable_node_cache);
+ 	kmem_cache_destroy(rmap_item_cache);
++	kmem_cache_destroy(migrate_bloom_info_cache);
+ 	mm_slot_cache = NULL;
+ }
+ 
+@@ -378,8 +504,8 @@
+ {
+ 	struct rmap_item *rmap_item;
+ 
+-	rmap_item = kmem_cache_zalloc(rmap_item_cache, GFP_KERNEL |
+-						__GFP_NORETRY | __GFP_NOWARN);
++	rmap_item = kmem_cache_zalloc(
++		rmap_item_cache, GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN);
+ 	if (rmap_item)
+ 		ksm_rmap_items++;
+ 	return rmap_item;
+@@ -409,6 +535,21 @@
+ 	kmem_cache_free(stable_node_cache, stable_node);
+ }
+ 
++static inline struct migrate_bloom_info *alloc_migrate_bloom_info(void)
++{
++	if (!migrate_bloom_info_cache) {
++		BUG_ON(migrate_bloom_info_cache == NULL);
++		return NULL;
++	}
++	return kmem_cache_zalloc(migrate_bloom_info_cache, GFP_KERNEL);
++}
++
++static inline void
++free_migrate_bloom_info(struct migrate_bloom_info *migrate_bloom_info)
++{
++	kmem_cache_free(migrate_bloom_info_cache, migrate_bloom_info);
++}
++
+ static inline struct mm_slot *alloc_mm_slot(void)
+ {
+ 	if (!mm_slot_cache)	/* initialization failed */
+@@ -432,10 +573,26 @@
+ 	return NULL;
+ }
+ 
++static struct mm_slot *get_mm_slot2(struct mm_struct *mm)
++{
++	struct mm_slot *mm_slot = NULL;
++	if (mm == ksm_scan.mm_slot->mm) {
++		mm_slot = ksm_scan.mm_slot;
++	} else {
++		mm_slot = list_entry(ksm_scan.mm_slot->mm_list.next,
++				     struct mm_slot, mm_list);
++		if (mm != mm_slot->mm) {
++			mm_slot = get_mm_slot(mm);
++		}
++	}
++	return mm_slot;
++}
++
+ static void insert_to_mm_slots_hash(struct mm_struct *mm,
+ 				    struct mm_slot *mm_slot)
+ {
+ 	mm_slot->mm = mm;
++	mm_slot->node_id = cpu_to_node(task_cpu(mm->owner));
+ 	hash_add(mm_slots_hash, &mm_slot->link, (unsigned long)mm);
+ }
+ 
+@@ -479,13 +636,14 @@
+ 		if (IS_ERR_OR_NULL(page))
+ 			break;
+ 		if (PageKsm(page))
+-			ret = handle_mm_fault(vma, addr,
+-					      FAULT_FLAG_WRITE | FAULT_FLAG_REMOTE,
++			ret = handle_mm_fault(
++				vma, addr, FAULT_FLAG_WRITE | FAULT_FLAG_REMOTE,
+ 					      NULL);
+ 		else
+ 			ret = VM_FAULT_WRITE;
+ 		put_page(page);
+-	} while (!(ret & (VM_FAULT_WRITE | VM_FAULT_SIGBUS | VM_FAULT_SIGSEGV | VM_FAULT_OOM)));
++	} while (!(ret & (VM_FAULT_WRITE | VM_FAULT_SIGBUS | VM_FAULT_SIGSEGV |
++			  VM_FAULT_OOM)));
+ 	/*
+ 	 * We must loop because handle_mm_fault() may back out if there's
+ 	 * any difficulty e.g. if pte accessed bit gets updated concurrently.
+@@ -552,10 +710,12 @@
+ 
+ static struct page *get_mergeable_page(struct rmap_item *rmap_item)
+ {
++	BUG_ON(rmap_item == NULL);
+ 	struct mm_struct *mm = rmap_item->mm;
+ 	unsigned long addr = rmap_item->address;
+ 	struct vm_area_struct *vma;
+ 	struct page *page;
++	BUG_ON(mm == NULL);
+ 
+ 	mmap_read_lock(mm);
+ 	vma = find_mergeable_vma(mm, addr);
+@@ -699,8 +859,8 @@
+ 	void *expected_mapping;
+ 	unsigned long kpfn;
+ 
+-	expected_mapping = (void *)((unsigned long)stable_node |
+-					PAGE_MAPPING_KSM);
++	expected_mapping =
++		(void *)((unsigned long)stable_node | PAGE_MAPPING_KSM);
+ again:
+ 	kpfn = READ_ONCE(stable_node->kpfn); /* Address dependency. */
+ 	page = pfn_to_page(kpfn);
+@@ -825,6 +985,7 @@
+ 		*rmap_list = rmap_item->rmap_list;
+ 		remove_rmap_item_from_tree(rmap_item);
+ 		free_rmap_item(rmap_item);
++		mm_slot->total_rmap_items--; // add
+ 	}
+ }
+ 
+@@ -841,8 +1002,8 @@
+  * to the next pass of ksmd - consider, for example, how ksmd might be
+  * in cmp_and_merge_page on one of the rmap_items we would be removing.
+  */
+-static int unmerge_ksm_pages(struct vm_area_struct *vma,
+-			     unsigned long start, unsigned long end)
++static int unmerge_ksm_pages(struct vm_area_struct *vma, unsigned long start,
++			     unsigned long end)
+ {
+ 	unsigned long addr;
+ 	int err = 0;
+@@ -925,8 +1086,8 @@
+ 			return false;
+ 	}
+ 
+-	hlist_for_each_entry_safe(dup, hlist_safe,
+-				  &stable_node->hlist, hlist_dup) {
++	hlist_for_each_entry_safe (dup, hlist_safe, &stable_node->hlist,
++				   hlist_dup) {
+ 		VM_BUG_ON(!is_stable_node_dup(dup));
+ 		if (remove_stable_node(dup))
+ 			return true;
+@@ -970,12 +1131,12 @@
+ 	int err = 0;
+ 
+ 	spin_lock(&ksm_mmlist_lock);
+-	ksm_scan.mm_slot = list_entry(ksm_mm_head.mm_list.next,
+-						struct mm_slot, mm_list);
++	ksm_scan.mm_slot =
++		list_entry(ksm_mm_head.mm_list.next, struct mm_slot, mm_list);
+ 	spin_unlock(&ksm_mmlist_lock);
+ 
+-	for (mm_slot = ksm_scan.mm_slot;
+-			mm_slot != &ksm_mm_head; mm_slot = ksm_scan.mm_slot) {
++	for (mm_slot = ksm_scan.mm_slot; mm_slot != &ksm_mm_head;
++	     mm_slot = ksm_scan.mm_slot) {
+ 		mm = mm_slot->mm;
+ 		mmap_read_lock(mm);
+ 		for (vma = mm->mmap; vma; vma = vma->vm_next) {
+@@ -983,8 +1144,8 @@
+ 				break;
+ 			if (!(vma->vm_flags & VM_MERGEABLE) || !vma->anon_vma)
+ 				continue;
+-			err = unmerge_ksm_pages(vma,
+-						vma->vm_start, vma->vm_end);
++			err = unmerge_ksm_pages(vma, vma->vm_start,
++						vma->vm_end);
+ 			if (err)
+ 				goto error;
+ 		}
+@@ -1049,8 +1210,7 @@
+ 	BUG_ON(PageTransCompound(page));
+ 
+ 	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma, mm,
+-				pvmw.address,
+-				pvmw.address + PAGE_SIZE);
++				pvmw.address, pvmw.address + PAGE_SIZE);
+ 	mmu_notifier_invalidate_range_start(&range);
+ 
+ 	if (!page_vma_mapped_walk(&pvmw))
+@@ -1156,8 +1316,8 @@
+ 		page_add_anon_rmap(kpage, vma, addr, false);
+ 		newpte = mk_pte(kpage, vma->vm_page_prot);
+ 	} else {
+-		newpte = pte_mkspecial(pfn_pte(page_to_pfn(kpage),
+-					       vma->vm_page_prot));
++		newpte = pte_mkspecial(
++			pfn_pte(page_to_pfn(kpage), vma->vm_page_prot));
+ 		/*
+ 		 * We're replacing an anonymous page with a zero page, which is
+ 		 * not anonymous. We need to do proper accounting otherwise we
+@@ -1199,8 +1359,8 @@
+  *
+  * This function returns 0 if the pages were merged, -EFAULT otherwise.
+  */
+-static int try_to_merge_one_page(struct vm_area_struct *vma,
+-				 struct page *page, struct page *kpage)
++static int try_to_merge_one_page(struct vm_area_struct *vma, struct page *page,
++				 struct page *kpage)
+ {
+ 	pte_t orig_pte = __pte(0);
+ 	int err = -EFAULT;
+@@ -1280,12 +1440,13 @@
+ 	struct mm_struct *mm = rmap_item->mm;
+ 	struct vm_area_struct *vma;
+ 	int err = -EFAULT;
++	// unsigned long addr;
+ 
+ 	mmap_read_lock(mm);
+ 	vma = find_mergeable_vma(mm, rmap_item->address);
+ 	if (!vma)
+ 		goto out;
+-
++	// addr = page_address_in_vma(page, vma);
+ 	err = try_to_merge_one_page(vma, page, kpage);
+ 	if (err)
+ 		goto out;
+@@ -1320,8 +1481,8 @@
+ 
+ 	err = try_to_merge_with_ksm_page(rmap_item, page, NULL);
+ 	if (!err) {
+-		err = try_to_merge_with_ksm_page(tree_rmap_item,
+-							tree_page, page);
++		err = try_to_merge_with_ksm_page(tree_rmap_item, tree_page,
++						 page);
+ 		/*
+ 		 * If that fails, we have a ksm page with only one pte
+ 		 * pointing to it: so break it.
+@@ -1332,8 +1493,8 @@
+ 	return err ? NULL : page;
+ }
+ 
+-static __always_inline
+-bool __is_page_sharing_candidate(struct stable_node *stable_node, int offset)
++static __always_inline bool
++__is_page_sharing_candidate(struct stable_node *stable_node, int offset)
+ {
+ 	VM_BUG_ON(stable_node->rmap_hlist_len < 0);
+ 	/*
+@@ -1346,8 +1507,8 @@
+ 		stable_node->rmap_hlist_len + offset < ksm_max_page_sharing;
+ }
+ 
+-static __always_inline
+-bool is_page_sharing_candidate(struct stable_node *stable_node)
++static __always_inline bool
++is_page_sharing_candidate(struct stable_node *stable_node)
+ {
+ 	return __is_page_sharing_candidate(stable_node, 0);
+ }
+@@ -1364,15 +1525,16 @@
+ 	int found_rmap_hlist_len;
+ 
+ 	if (!prune_stale_stable_nodes ||
+-	    time_before(jiffies, stable_node->chain_prune_time +
++	    time_before(jiffies,
++			stable_node->chain_prune_time +
+ 			msecs_to_jiffies(
+ 				ksm_stable_node_chains_prune_millisecs)))
+ 		prune_stale_stable_nodes = false;
+ 	else
+ 		stable_node->chain_prune_time = jiffies;
+ 
+-	hlist_for_each_entry_safe(dup, hlist_safe,
+-				  &stable_node->hlist, hlist_dup) {
++	hlist_for_each_entry_safe (dup, hlist_safe, &stable_node->hlist,
++				   hlist_dup) {
+ 		cond_resched();
+ 		/*
+ 		 * We must walk all stable_node_dup to prune the stale
+@@ -1426,8 +1588,7 @@
+ 			 * There's just one entry and it is below the
+ 			 * deduplication limit so drop the chain.
+ 			 */
+-			rb_replace_node(&stable_node->node, &found->node,
+-					root);
++			rb_replace_node(&stable_node->node, &found->node, root);
+ 			free_stable_node(stable_node);
+ 			ksm_stable_node_chains--;
+ 			ksm_stable_node_dups--;
+@@ -1462,8 +1623,7 @@
+ 			 * but the total number of dups in the chain.
+ 			 */
+ 			hlist_del(&found->hlist_dup);
+-			hlist_add_head(&found->hlist_dup,
+-				       &stable_node->hlist);
++			hlist_add_head(&found->hlist_dup, &stable_node->hlist);
+ 		}
+ 	}
+ 
+@@ -1480,8 +1640,8 @@
+ 		free_stable_node_chain(stable_node, root);
+ 		return NULL;
+ 	}
+-	return hlist_entry(stable_node->hlist.first,
+-			   typeof(*stable_node), hlist_dup);
++	return hlist_entry(stable_node->hlist.first, typeof(*stable_node),
++			   hlist_dup);
+ }
+ 
+ /*
+@@ -1527,9 +1687,8 @@
+ 	return __stable_node_chain(s_n_d, s_n, root, true);
+ }
+ 
+-static __always_inline struct page *chain(struct stable_node **s_n_d,
+-					  struct stable_node *s_n,
+-					  struct rb_root *root)
++static __always_inline struct page *
++chain(struct stable_node **s_n_d, struct stable_node *s_n, struct rb_root *root)
+ {
+ 	struct stable_node *old_stable_node = s_n;
+ 	struct page *tree_page;
+@@ -1549,9 +1708,9 @@
+  * This function returns the stable tree node of identical content if found,
+  * NULL otherwise.
+  */
+-static struct page *stable_tree_search(struct page *page)
++static struct page *stable_tree_search(struct page *page, int nid)
+ {
+-	int nid;
++	// int nid;
+ 	struct rb_root *root;
+ 	struct rb_node **new;
+ 	struct rb_node *parent;
+@@ -1565,7 +1724,7 @@
+ 		return page;
+ 	}
+ 
+-	nid = get_kpfn_nid(page_to_pfn(page));
++	// nid = get_kpfn_nid(page_to_pfn(page));
+ 	root = root_stable_tree + nid;
+ again:
+ 	new = &root->rb_node;
+@@ -1597,8 +1756,8 @@
+ 			 * this stable_node chain, or this chain was
+ 			 * empty and should be rb_erased.
+ 			 */
+-			stable_node_any = stable_node_dup_any(stable_node,
+-							      root);
++			stable_node_any =
++				stable_node_dup_any(stable_node, root);
+ 			if (!stable_node_any) {
+ 				/* rb_erase just run */
+ 				goto again;
+@@ -1728,8 +1887,7 @@
+ 			list_del(&page_node->list);
+ 			DO_NUMA(page_node->nid = nid);
+ 			rb_replace_node(&stable_node_dup->node,
+-					&page_node->node,
+-					root);
++					&page_node->node, root);
+ 			if (is_page_sharing_candidate(page_node))
+ 				get_page(page);
+ 			else
+@@ -1774,8 +1932,7 @@
+ 		VM_BUG_ON(is_stable_node_chain(stable_node_dup));
+ 		VM_BUG_ON(is_stable_node_dup(stable_node_dup));
+ 		/* chain is missing so create it */
+-		stable_node = alloc_stable_node_chain(stable_node_dup,
+-						      root);
++		stable_node = alloc_stable_node_chain(stable_node_dup, root);
+ 		if (!stable_node)
+ 			return NULL;
+ 	}
+@@ -1832,8 +1989,8 @@
+ 			 * this stable_node chain, or this chain was
+ 			 * empty and should be rb_erased.
+ 			 */
+-			stable_node_any = stable_node_dup_any(stable_node,
+-							      root);
++			stable_node_any =
++				stable_node_dup_any(stable_node, root);
+ 			if (!stable_node_any) {
+ 				/* rb_erase just run */
+ 				goto again;
+@@ -1920,9 +2077,8 @@
+  * This function does both searching and inserting, because they share
+  * the same walking algorithm in an rbtree.
+  */
+-static
+-struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
+-					      struct page *page,
++static struct rmap_item *
++unstable_tree_search_insert(struct rmap_item *rmap_item, struct page *page,
+ 					      struct page **tree_pagep)
+ {
+ 	struct rb_node **new;
+@@ -1987,6 +2143,58 @@
+ 	return NULL;
+ }
+ 
++static struct rmap_item *
++unstable_tree_search_insert2(struct rmap_item *rmap_item, struct page *page,
++			     int nid, struct page **tree_pagep, int insert)
++{
++	struct rb_node **new;
++	struct rb_root *root;
++	struct rb_node *parent = NULL;
++	root = root_unstable_tree + nid;
++	new = &root->rb_node;
++	while (*new) {
++		struct rmap_item *tree_rmap_item;
++		struct page *tree_page;
++		int ret;
++
++		cond_resched();
++		tree_rmap_item = rb_entry(*new, struct rmap_item, node);
++		tree_page = get_mergeable_page(tree_rmap_item);
++		if (!tree_page) {
++			return NULL;
++		}
++
++		/*
++* Don't substitute a ksm page for a forked page.
++*/
++		if (page == tree_page) {
++			put_page(tree_page);
++			return NULL;
++		}
++
++		ret = memcmp_pages(page, tree_page);
++		parent = *new;
++		if (ret < 0) {
++			put_page(tree_page);
++			new = &parent->rb_left;
++		} else if (ret > 0) {
++			put_page(tree_page);
++			new = &parent->rb_right;
++		} else {
++			*tree_pagep = tree_page;
++			return tree_rmap_item;
++		}
++	}
++	if (insert) {
++		rmap_item->address |= UNSTABLE_FLAG;
++		rmap_item->address |= (ksm_scan.seqnr & SEQNR_MASK);
++		DO_NUMA(rmap_item->nid = nid);
++		rb_link_node(&rmap_item->node, parent, new);
++		rb_insert_color(&rmap_item->node, root);
++		ksm_pages_unshared++;
++	}
++	return NULL;
++}
+ /*
+  * stable_tree_append - add another rmap_item to the linked list of
+  * rmap_items hanging off a given node of the stable tree, all sharing
+@@ -2033,14 +2241,16 @@
+  * @page: the page that we are searching identical page to.
+  * @rmap_item: the reverse mapping into the virtual address of this page
+  */
+-static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
++static void cmp_and_merge_page_checksum(struct page *page,
++					struct rmap_item *rmap_item,
++					unsigned int checksum, int has_checksum)
+ {
+ 	struct mm_struct *mm = rmap_item->mm;
+ 	struct rmap_item *tree_rmap_item;
+ 	struct page *tree_page = NULL;
+ 	struct stable_node *stable_node;
+ 	struct page *kpage;
+-	unsigned int checksum;
++	// unsigned int checksum;
+ 	int err;
+ 	bool max_page_sharing_bypass = false;
+ 
+@@ -2065,7 +2275,7 @@
+ 	}
+ 
+ 	/* We first start with searching the page inside the stable tree */
+-	kpage = stable_tree_search(page);
++	kpage = stable_tree_search(page, get_kpfn_nid(page_to_pfn(page)));
+ 	if (kpage == page && rmap_item->head == stable_node) {
+ 		put_page(kpage);
+ 		return;
+@@ -2098,6 +2308,7 @@
+ 	 * don't want to insert it in the unstable tree, and we don't want
+ 	 * to waste our time searching for something identical to it there.
+ 	 */
++	if (!has_checksum)
+ 	checksum = calc_checksum(page);
+ 	if (rmap_item->oldchecksum != checksum) {
+ 		rmap_item->oldchecksum = checksum;
+@@ -2114,8 +2325,8 @@
+ 		mmap_read_lock(mm);
+ 		vma = find_mergeable_vma(mm, rmap_item->address);
+ 		if (vma) {
+-			err = try_to_merge_one_page(vma, page,
+-					ZERO_PAGE(rmap_item->address));
++			err = try_to_merge_one_page(
++				vma, page, ZERO_PAGE(rmap_item->address));
+ 		} else {
+ 			/*
+ 			 * If the vma is out of date, we do not need to
+@@ -2136,8 +2347,8 @@
+ 	if (tree_rmap_item) {
+ 		bool split;
+ 
+-		kpage = try_to_merge_two_pages(rmap_item, page,
+-						tree_rmap_item, tree_page);
++		kpage = try_to_merge_two_pages(rmap_item, page, tree_rmap_item,
++					       tree_page);
+ 		/*
+ 		 * If both pages we tried to merge belong to the same compound
+ 		 * page, then we actually ended up increasing the reference
+@@ -2148,8 +2359,8 @@
+ 		 * afterwards, the reference count will be correct and
+ 		 * split_huge_page should succeed.
+ 		 */
+-		split = PageTransCompound(page)
+-			&& compound_head(page) == compound_head(tree_page);
++		split = PageTransCompound(page) &&
++			compound_head(page) == compound_head(tree_page);
+ 		put_page(tree_page);
+ 		if (kpage) {
+ 			/*
+@@ -2209,6 +2420,7 @@
+ 		*rmap_list = rmap_item->rmap_list;
+ 		remove_rmap_item_from_tree(rmap_item);
+ 		free_rmap_item(rmap_item);
++		mm_slot->total_rmap_items--; // add
+ 	}
+ 
+ 	rmap_item = alloc_rmap_item();
+@@ -2216,12 +2428,19 @@
+ 		/* It has already been zeroed */
+ 		rmap_item->mm = mm_slot->mm;
+ 		rmap_item->address = addr;
++		rmap_item->active = 0;
+ 		rmap_item->rmap_list = *rmap_list;
+ 		*rmap_list = rmap_item;
+ 	}
++	mm_slot->total_rmap_items++;
+ 	return rmap_item;
+ }
+ 
++struct timespec64 round_start, round_end;
++static int migrate_vms_cpu_mem_pgtables(struct mm_slot *slot,
++					struct task_struct *task, int src_nid,
++					int des_nid);
++static char current_scan_nid = 0;
+ static struct rmap_item *scan_get_next_rmap_item(struct page **page)
+ {
+ 	struct mm_struct *mm;
+@@ -2273,6 +2492,7 @@
+ 		spin_lock(&ksm_mmlist_lock);
+ 		slot = list_entry(slot->mm_list.next, struct mm_slot, mm_list);
+ 		ksm_scan.mm_slot = slot;
++		current_scan_nid = slot->node_id;
+ 		spin_unlock(&ksm_mmlist_lock);
+ 		/*
+ 		 * Although we tested list_empty() above, a racing __ksm_exit
+@@ -2283,6 +2503,8 @@
+ next_mm:
+ 		ksm_scan.address = 0;
+ 		ksm_scan.rmap_list = &slot->rmap_list;
++		printk("<7>AdaptMD: scan NUMA id=%d, pid=%d\n",
++		       current_scan_nid, ksm_scan.mm_slot->mm->owner->pid);
+ 	}
+ 
+ 	mm = slot->mm;
+@@ -2312,8 +2534,10 @@
+ 			if (PageAnon(*page)) {
+ 				flush_anon_page(vma, *page, ksm_scan.address);
+ 				flush_dcache_page(*page);
+-				rmap_item = get_next_rmap_item(slot,
+-					ksm_scan.rmap_list, ksm_scan.address);
++				rmap_item =
++					get_next_rmap_item(slot,
++							   ksm_scan.rmap_list,
++							   ksm_scan.address);
+ 				if (rmap_item) {
+ 					ksm_scan.rmap_list =
+ 							&rmap_item->rmap_list;
+@@ -2340,8 +2564,9 @@
+ 	remove_trailing_rmap_items(slot, ksm_scan.rmap_list);
+ 
+ 	spin_lock(&ksm_mmlist_lock);
+-	ksm_scan.mm_slot = list_entry(slot->mm_list.next,
+-						struct mm_slot, mm_list);
++	ksm_scan.mm_slot =
++		list_entry(slot->mm_list.next, struct mm_slot, mm_list);
++	current_scan_nid = ksm_scan.mm_slot->node_id;
+ 	if (ksm_scan.address == 0) {
+ 		/*
+ 		 * We've completed a full scan of all vmas, holding mmap_lock
+@@ -2377,7 +2602,28 @@
+ 	if (slot != &ksm_mm_head)
+ 		goto next_mm;
+ 
++	if (slot == &ksm_mm_head) {
++		do {
++			spin_lock(&ksm_mmlist_lock);
++			slot = list_entry(slot->mm_list.next, struct mm_slot,
++					  mm_list);
++			spin_unlock(&ksm_mmlist_lock);
++			mm = slot->mm;
++			if (slot == NULL || slot == &ksm_mm_head ||
++			    ksm_test_exit(mm)) {
++				break;
++			}
++		} while (slot != &ksm_mm_head);
++		ksm_scan.mm_slot == &ksm_mm_head;
++	}
++
++	ktime_get_ts64(&round_end);
++	printk("<7>AdaptMD: seqnr=%lu time spent: %lld us\n", ksm_scan.seqnr,
++	       (round_end.tv_sec - round_start.tv_sec) * 1000000LL +
++		       (round_end.tv_nsec - round_start.tv_nsec) /
++			       1000LL); // Convert ns to us
+ 	ksm_scan.seqnr++;
++	ktime_get_ts64(&round_start);
+ 	return NULL;
+ }
+ 
+@@ -2389,13 +2635,17 @@
+ {
+ 	struct rmap_item *rmap_item;
+ 	struct page *page;
++	struct mm_slot *slot;
+ 
+ 	while (scan_npages-- && likely(!freezing(current))) {
+ 		cond_resched();
+ 		rmap_item = scan_get_next_rmap_item(&page);
+-		if (!rmap_item)
++		if (!rmap_item) {
+ 			return;
+-		cmp_and_merge_page(page, rmap_item);
++		}
++		slot = ksm_scan.mm_slot;
++		BUG_ON(rmap_item->mm != slot->mm);
++		cmp_and_merge_page_checksum(page, rmap_item, 0, 0);
+ 		put_page(page);
+ 	}
+ }
+@@ -2405,32 +2655,1988 @@
+ 	return (ksm_run & KSM_RUN_MERGE) && !list_empty(&ksm_mm_head.mm_list);
+ }
+ 
++static int cmp_and_merge_accross_nodes(struct page *page,
++				       struct rmap_item *rmap_item, int nid,
++				       unsigned int checksum)
++{
++	struct stable_node *stable_node;
++	struct page *tree_page = NULL;
++	struct page *kpage;
++	int err = 0;
++	struct rmap_item *tree_rmap_item;
++	stable_node = page_stable_node(page);
++	if (stable_node) {
++		cmp_and_merge_page_checksum(page, rmap_item, checksum, 1);
++		return 1;
++	}
++	kpage = stable_tree_search(page, nid);
++	if (kpage == page && rmap_item->head == stable_node) {
++		put_page(kpage);
++		return 1;
++	}
++	remove_rmap_item_from_tree(rmap_item);
++	if (kpage) {
++		err = try_to_merge_with_ksm_page(rmap_item, page, kpage);
++		if (!err) {
++			lock_page(kpage);
++			stable_tree_append(rmap_item, page_stable_node(kpage),
++					   false);
++			unlock_page(kpage);
++			err = 1;
++		}
++		put_page(kpage);
++		return err;
++	}
++	tree_rmap_item = unstable_tree_search_insert2(rmap_item, page, nid,
++						      &tree_page, 0);
++	err = 0;
++	if (tree_rmap_item) {
++		kpage = try_to_merge_two_pages(rmap_item, page, tree_rmap_item,
++					       tree_page);
++		put_page(tree_page);
++		if (kpage) {
++			lock_page(kpage);
++			stable_node = stable_tree_insert(kpage);
++			if (stable_node) {
++				stable_tree_append(tree_rmap_item, stable_node,
++						   false);
++				stable_tree_append(rmap_item, stable_node,
++						   false);
++				err = 1;
++			}
++			unlock_page(kpage);
++			if (!stable_node) {
++				break_cow(tree_rmap_item);
++				break_cow(rmap_item);
++			}
++		}
++	} /*else {
++            cmp_and_merge_page_checksum(page, rmap_item,checksum,1);
++            err=1;
++    }*/
++	return err;
++}
++
++static int set_and_test_cold_pages(struct rmap_item *rmap_item,
++				   struct page *page)
++{
++	int ret = 0;
++	struct mem_cgroup *memcg;
++	unsigned long vm_flags;
++
++	memcg = page->mem_cgroup;
++	if (page_referenced(page, 1, memcg, &vm_flags) == 0) {
++		if (rmap_item->active > 0) {
++			rmap_item->active = -1;
++		} else {
++			rmap_item->active--;
++		}
++	} else {
++		if (rmap_item->active < 0) {
++			rmap_item->active = 1;
++		} else {
++			rmap_item->active++;
++		}
++	}
++	if (rmap_item->active <= -active_threshold) {
++		ret = 1;
++	} else {
++		ret = 0;
++	}
++	return ret;
++}
++
++static int get_vm_vcpus(struct task_struct *task)
++{
++	struct files_struct *files;
++	struct file *file;
++	char buffer[32];
++	char *fname;
++	int fd, max_fds;
++	struct kvm *kvm = NULL;
++
++	files = task->files;
++	max_fds = files_fdtable(files)->max_fds;
++	for (fd = 0; fd < max_fds; fd++) {
++		if (!(file = fcheck_files(files, fd)))
++			continue;
++		fname = d_path(&(file->f_path), buffer, sizeof(buffer));
++		if (fname < buffer || fname >= buffer + sizeof(buffer))
++			continue;
++		if (strcmp(fname, "anon_inode:kvm-vm") == 0) {
++			kvm = file->private_data;
++			// assert(kvm);
++			// kvm_get_kvm(kvm);
++			// return kvm;
++			return atomic_read(&kvm->online_vcpus);
++		}
++	}
++	return -1;
++}
++
++static int stable_cold_pages = 0;
++static void ksm_do_scan_across_nodes(unsigned int scan_npages,
++				     int *construct_bitmap[])
++{
++	int err = 0;
++	int has_calc_checksum = 0;
++	int nid = 0;
++	u32 index1, index2, index3;
++	int tmpnid;
++	unsigned long seqnr = 0;
++	unsigned int checksum;
++	struct rmap_item *rmap_item;
++	struct page *page;
++	int total_items = 0;
++	int cold_page = 0;
++	int mask = 0;
++	int size = 0;
++	if (ksm_nr_node_ids == 2) {
++		mask = 0x3FFFFFF;
++		size = NUMA_2_NODE_BLOOM_SIZE >> 5;
++	} else if (ksm_nr_node_ids == 4) {
++		mask = 0x1FFFFFF;
++		size = NUMA_4_NODE_BLOOM_SIZE >> 5;
++	}
++	seqnr = ksm_scan.seqnr;
++	while (scan_npages-- && likely(!freezing(current))) {
++		has_calc_checksum = err = 0;
++		cond_resched();
++		rmap_item = scan_get_next_rmap_item(&page);
++		if (!rmap_item) {
++			if (ksm_scan.seqnr > seqnr) {
++				total_items =
++					ksm_rmap_items - ksm_pages_shared -
++					ksm_pages_sharing - ksm_pages_unshared;
++				if (ksm_rmap_items) {
++					printk("<7>AdaptMD: seqnr=%lu, dedup rate(*0.1)=%lu...\n",
++					       ksm_scan.seqnr - 1,
++					       ksm_pages_sharing * 1000 /
++						       ksm_rmap_items);
++				}
++				printk("<7>AdaptMD: cold pages=%lu, hot pages=%lu, non-cold pages=%lu, hotness-aware dedup successful=%lu\n",
++				       cold_page_numbers, hot_page_numbers,
++				       non_cold_page_numbers,
++				       hotness_successful);
++				printk("<7>AdaptMD: cold page in other NUMA nodes=%lu, none exist=%lu\n",
++				       exist_numbers, none_exist_numbers);
++				reset_bitmap(construct_bitmap, size << 5);
++				hotness_successful = 0;
++				exist_numbers = 0;
++				none_exist_numbers = 0;
++				cold_page_numbers = 0;
++				hot_page_numbers = 0;
++				non_cold_page_numbers = 0;
++				stable_cold_pages = 0;
++			}
++			return;
++		}
++		nid = page_to_nid(page);
++		if (!PageKsm(page)) // page_stable_node(page)
++		{
++			checksum = calc_checksum(page);
++			has_calc_checksum = 1;
++			remove_rmap_item_from_tree(rmap_item);
++			if (rmap_item->oldchecksum != checksum) {
++				rmap_item->oldchecksum = checksum;
++				put_page(page);
++				continue;
++			}
++
++			if (!use_one_hash) {
++				set_bitmap((checksum >> 3) & mask,
++					   construct_bitmap[nid]);
++				set_bitmap((checksum >> 6) & mask,
++					   construct_bitmap[nid]);
++			}
++			set_bitmap(checksum & mask, construct_bitmap[nid]);
++			cold_page = set_and_test_cold_pages(rmap_item, page);
++			if (cold_page) {
++				cold_page_numbers++;
++				for (tmpnid = 0; tmpnid < ksm_nr_node_ids;
++				     tmpnid++) {
++					index1 = test_bitmap(
++						checksum & mask,
++						construct_bitmap[tmpnid]);
++					if (!use_one_hash) {
++						index2 = test_bitmap(
++							(checksum >> 3) & mask,
++							construct_bitmap[tmpnid]);
++						index3 = test_bitmap(
++							(checksum >> 6) & mask,
++							construct_bitmap[tmpnid]);
++						index1 = index1 && index2 &&
++							 index3;
++					}
++					if (index1) {
++						exist_numbers++;
++						err = cmp_and_merge_accross_nodes(
++							page, rmap_item, tmpnid,
++							checksum);
++						if (err) {
++							hotness_successful++;
++							break;
++						}
++					} else {
++						none_exist_numbers++;
++					}
++				}
++			} else {
++				non_cold_page_numbers++;
++			}
++		} else {
++			nid = page_to_nid(page);
++			if (!use_one_hash) {
++				set_bitmap((rmap_item->oldchecksum >> 3) & mask,
++					   construct_bitmap[nid]);
++				set_bitmap((rmap_item->oldchecksum >> 6) & mask,
++					   construct_bitmap[nid]);
++			}
++			set_bitmap(rmap_item->oldchecksum & mask,
++				   construct_bitmap[nid]);
++			non_cold_page_numbers++;
++		}
++		if (!err) {
++			if (has_calc_checksum) {
++				cmp_and_merge_page_checksum(page, rmap_item,
++							    checksum, 1);
++			} else {
++				cmp_and_merge_page_checksum(page, rmap_item, 0,
++							    0);
++			}
++		}
++		put_page(page);
++	}
++}
++
++static void ksm_do_scan_across_nodes_without_bloom(unsigned int scan_npages)
++{
++	int err = 0;
++	int has_calc_checksum = 0;
++	int nid = 0;
++	int tmpnid;
++	unsigned int checksum;
++	struct rmap_item *rmap_item;
++	struct mm_slot *slot;
++	unsigned long seqnr = ksm_scan.seqnr;
++	struct page *page;
++	int total_items = 0;
++	int cold_page = 0;
++	while (scan_npages-- && likely(!freezing(current))) {
++		has_calc_checksum = err = 0;
++		cond_resched();
++		rmap_item = scan_get_next_rmap_item(&page);
++		if (!rmap_item) {
++			if (ksm_scan.seqnr > seqnr) {
++				printk("<7>AdaptMD: cold pages=%lu, hot pages=%lu, non-cold pages=%lu, hotness-aware dedup successful=%lu\n",
++				       cold_page_numbers, hot_page_numbers,
++				       non_cold_page_numbers,
++				       hotness_successful);
++				printk("<7>AdaptMD: cold page in other NUMA nodes=%lu, none exist=%lu\n",
++				       exist_numbers, none_exist_numbers);
++				total_items = 0;
++				hotness_successful = 0;
++				exist_numbers = 0;
++				none_exist_numbers = 0;
++				cold_page_numbers = 0;
++				hot_page_numbers = 0;
++				non_cold_page_numbers = 0;
++			}
++			return;
++		}
++		total_items++;
++		nid = page_to_nid(page);
++		slot = get_mm_slot2(rmap_item->mm);
++		if (!PageKsm(page)) // page_stable_node(page)==NULL
++		{
++			checksum = calc_checksum(page);
++			has_calc_checksum = 1;
++			remove_rmap_item_from_tree(rmap_item);
++			if (rmap_item->oldchecksum != checksum) {
++				rmap_item->oldchecksum = checksum;
++				put_page(page);
++				continue;
++			}
++
++			cold_page = set_and_test_cold_pages(rmap_item, page);
++			if (cold_page == 1) {
++				cold_page_numbers++;
++				for (tmpnid = 0; tmpnid < ksm_nr_node_ids;
++				     tmpnid++) {
++					if (tmpnid != nid) {
++						err = cmp_and_merge_accross_nodes(
++							page, rmap_item, tmpnid,
++							checksum);
++						if (err) {
++							hotness_successful++;
++							break;
++						}
++					}
++				}
++			} else {
++				if (cold_page == -1) {
++					hot_page_numbers++;
++				}
++				non_cold_page_numbers++;
++			}
++		} else {
++			non_cold_page_numbers++;
++		}
++		if (!err) {
++			if (has_calc_checksum) {
++				cmp_and_merge_page_checksum(page, rmap_item,
++							    checksum, 1);
++			} else {
++				cmp_and_merge_page_checksum(page, rmap_item, 0,
++							    0);
++			}
++		}
++		put_page(page);
++	}
++}
++
++static void hotness_aware_ksm(void)
++{
++	struct timespec64 start, end;
++	switch (ctl_flag) {
++	case 0:
++		ksm_do_scan(ksm_thread_pages_to_scan);
++		break;
++	case 9: // ctl_flag==9(0x1001)
++		if (use_bloom_filter) {
++			ktime_get_ts64(&start);
++			ksm_do_scan_across_nodes(ksm_thread_pages_to_scan,
++						 bitmap);
++			ktime_get_ts64(&end);
++		} else {
++			ksm_do_scan_across_nodes_without_bloom(
++				ksm_thread_pages_to_scan);
++		}
++		break;
++	default:
++		ksm_do_scan(ksm_thread_pages_to_scan);
++		break;
++	}
++}
++
++static void set_bloom_array_migration(unsigned int *bloom_array, u32 index,
++				      int value, u64 mask)
++{
++	if (!bloom_array || index < 0) {
++		printk("<7>AdaptMD: func:%s, bloom_array=%p\tindex=%u\n",
++		       __func__, bloom_array, index);
++		return;
++	}
++	index &= mask;
++	if (value) {
++		bloom_array[index >> 5] |= (1 << (index & 0x1f));
++	} else {
++		bloom_array[index >> 5] &= ~(1 << (index & 0x1f));
++	}
++}
++
++static unsigned int bloom_array_bits[32] = {
++	0x1,	    0x2,       0x4,	  0x8,	     0x10,	 0x20,
++	0x40,	    0x80,      0x100,	  0x200,     0x400,	 0x800,
++	0x1000,	    0x2000,    0x4000,	  0x8000,    0x10000,	 0x20000,
++	0x40000,    0x80000,   0x100000,  0x200000,  0x400000,	 0x800000,
++	0x1000000,  0x2000000, 0x4000000, 0x8000000, 0x10000000, 0x20000000,
++	0x40000000, 0x80000000
++};
++static unsigned int cmp_bloom_array(unsigned int *src_array,
++				    unsigned int *des_array, unsigned long size)
++{
++	u32 res = 0, j = 0;
++	u64 i, tmp1, tmp2, tmp3 = 0;
++	if (src_array && des_array) {
++		for (i = 0; i < size; i++) {
++			if (src_array[i] == 0 || des_array[i] == 0) {
++				tmp3++;
++				continue;
++			} else {
++				tmp1 = src_array[i];
++				tmp2 = des_array[i];
++				for (j = 0; j < 32; j++) {
++					if (((u32)(tmp1 & bloom_array_bits[j]) >
++					     0) &&
++					    ((u32)(tmp2 & bloom_array_bits[j]) >
++					     0)) {
++						res++;
++					}
++				}
++			}
++		}
++	}
++	return res;
++}
++
++static u32 min_num(u32 num1, u32 num2)
++{
++	return (u32)(num1 > num2 ? num2 : num1);
++}
++#ifdef arch_idle_time
++static cputime64_t get_idle_time(int cpu)
++{
++	cputime64_t idle;
++
++	idle = kcpustat_cpu(cpu).cpustat[CPUTIME_IDLE];
++	if (cpu_online(cpu) && !nr_iowait_cpu(cpu))
++		idle += arch_idle_time(cpu);
++	return idle;
++}
++static cputime64_t get_iowait_time(int cpu)
++{
++	cputime64_t iowait;
++
++	iowait = kcpustat_cpu(cpu).cpustat[CPUTIME_IOWAIT];
++	if (cpu_online(cpu) && nr_iowait_cpu(cpu))
++		iowait += arch_idle_time(cpu);
++	return iowait;
++}
++#else
++static u64 get_idle_time(int cpu)
++{
++	u64 idle, idle_time = -1ULL;
++	if (cpu_online(cpu))
++		idle_time = get_cpu_idle_time_us(cpu, NULL);
++	if (idle_time == -1ULL)
++		/* !NO_HZ or cpu offline so we can rely on cpustat.idle */
++		idle = kcpustat_cpu(cpu).cpustat[CPUTIME_IDLE];
++	else
++		idle = usecs_to_jiffies(idle_time);
++	return idle;
++}
++
++static u64 get_iowait_time(int cpu)
++{
++	u64 iowait, iowait_time = -1ULL;
++	if (cpu_online(cpu))
++		iowait_time = get_cpu_iowait_time_us(cpu, NULL);
++	if (iowait_time == -1ULL)
++		/* !NO_HZ or cpu offline so we can rely on cpustat.iowait */
++		iowait = kcpustat_cpu(cpu).cpustat[CPUTIME_IOWAIT];
++	else
++		iowait = usecs_to_jiffies(iowait_time);
++	return iowait;
++}
++#endif
++
++#define LOAD_INT(x) ((x) >> FSHIFT)
++#define LOAD_FRAC(x) LOAD_INT(((x) & (FIXED_1 - 1)) * 100)
++
++static void get_node_cpu_load(u32 nid, u64 *total_cpu_cycles,
++			      u64 *idle_cpu_cycles)
++{
++	u32 i;
++	u64 per_cpu_idle = 0, per_cpu_total = 0;
++	const struct cpumask *mask = NULL;
++	u64 node_idle = 0, node_total = 0;
++	mask = cpumask_of_node(nid);
++	for (i = 0; i < nr_cpu_ids; i++) {
++		if (cpumask_test_cpu(i, mask)) {
++			per_cpu_total = per_cpu_idle = 0;
++			per_cpu_idle += get_idle_time(i);
++			per_cpu_idle += get_iowait_time(i);
++			per_cpu_total += per_cpu_idle;
++			per_cpu_total += kcpustat_cpu(i).cpustat[CPUTIME_USER];
++			per_cpu_total += kcpustat_cpu(i).cpustat[CPUTIME_NICE];
++			per_cpu_total +=
++				kcpustat_cpu(i).cpustat[CPUTIME_SYSTEM];
++			per_cpu_total += kcpustat_cpu(i).cpustat[CPUTIME_IRQ];
++			per_cpu_total +=
++				kcpustat_cpu(i).cpustat[CPUTIME_SOFTIRQ];
++			per_cpu_total += kcpustat_cpu(i).cpustat[CPUTIME_STEAL];
++			// per_cpu_total += kcpustat_cpu(i).cpustat[CPUTIME_GUEST];
++			// per_cpu_total += kcpustat_cpu(i).cpustat[CPUTIME_GUEST_NICE];
++			// printk("<7>cpu %d : per_cpu_total =%llu\tidle=%llu\n", i, cputime64_to_clock_t(per_cpu_total), cputime64_to_clock_t(per_cpu_idle));
++			node_total += per_cpu_total;
++			node_idle += per_cpu_idle;
++		}
++	}
++	*total_cpu_cycles = nsec_to_clock_t(node_total);
++	*idle_cpu_cycles = nsec_to_clock_t(node_idle);
++}
++
++static int set_cpus_affinfity(struct task_struct *task,
++			      const struct cpumask *mask)
++{
++	int ret = -1;
++	struct task_struct *thread_task;
++	if (cpumask_empty(mask)) {
++		return -1;
++	}
++	rcu_read_lock();
++	thread_task = task;
++
++	// printk("<7> task PID:%d, TGID=%d,NR_THREADS=%d, COMMAND=%s\n", task->pid, task->tgid, get_nr_threads(task), task->comm);
++	if (thread_task) {
++		ret = sched_setaffinity(thread_task->pid, mask);
++		if (ret) {
++			ret = set_cpus_allowed_ptr(thread_task, mask);
++		}
++	}
++	while_each_thread(task, thread_task)
++	{
++		// printk("<7> thread_task PID:%d, TGID=%d,NR_THREADS=%d, COMMAND=%s\n", thread_task->pid, thread_task->tgid, get_nr_threads(thread_task), thread_task->comm);
++		if (thread_task) {
++			ret = sched_setaffinity(thread_task->pid, mask);
++			if (ret) {
++				ret = set_cpus_allowed_ptr(thread_task, mask);
++			}
++		}
++	}
++	rcu_read_unlock();
++	return ret;
++}
++
++/////////////////////////////// Pagetable Migration Start///////////////////////
++#define PGALLOC_GFP GFP_KERNEL | __GFP_ZERO
++
++// static inline spinlock_t *pud_lockptr(struct mm_struct *mm, pud_t *pud)
++// {
++// 	return &mm->page_table_lock;
++// }
++
++static inline bool misplaced_pgtable(struct page *page, int nid)
++{
++	if (nid == NUMA_NO_NODE || page_to_nid(page) == nid)
++		return false;
++	return true;
++}
++
++static inline void copy_pgtable(struct page *dst, struct page *src)
++{
++	void *to, *from;
++	to = kmap_atomic(dst);
++	from = kmap_atomic(src);
++	copy_page(to, from);
++	kunmap_atomic(to);
++	kunmap_atomic(from);
++}
++
++pud_t *mm_find_pud(struct mm_struct *mm, unsigned long address)
++{
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++
++	pgd = pgd_offset(mm, address);
++	if (!pgd_present(*pgd))
++		goto out;
++
++	p4d = p4d_offset(pgd, address);
++	if (!p4d_present(*p4d))
++		goto out;
++
++	pud = pud_offset(p4d, address);
++	if (!pud_present(*pud))
++		goto out;
++
++	return pud;
++out:
++	return NULL;
++}
++
++static inline void deposit_pmd_pgtables(struct mm_struct *mm, pud_t *pud,
++					unsigned long addr, unsigned long end,
++					pgtable_t *pgtables)
++{
++	int count = 0;
++	pmd_t *pmd;
++	spinlock_t *ptl;
++	unsigned long next;
++
++	pmd = pmd_offset(pud, addr);
++	do {
++		next = pmd_addr_end(addr, end);
++		if (pmd_none(*pmd))
++			continue;
++		if (pmd_trans_huge(*pmd)) {
++			BUG_ON(!pgtables[count]);
++			ptl = pmd_lock(mm, pmd);
++			pgtable_trans_huge_deposit(mm, pmd, pgtables[count++]);
++			spin_unlock(ptl);
++		}
++	} while (pmd++, addr = next, addr != end);
++}
++
++static struct page *alloc_pgtable_page(int nid)
++{
++	struct page *page;
++	gfp_t gfp = PGALLOC_GFP;
++
++	if (nid != -1)
++		page = alloc_pages_node(nid, gfp, 0);
++	else
++		page = alloc_pages(gfp, 0);
++
++	if (!page)
++		return NULL;
++	if (!pgtable_pmd_page_ctor(page)) {
++		__free_pages(page, 0);
++		return NULL;
++	}
++	return page;
++}
++
++static inline void withdraw_pmd_pgtables(struct mm_struct *mm, pud_t *pud,
++					 unsigned long addr, unsigned long end,
++					 pgtable_t *pgtables)
++{
++	int count = 0;
++	pmd_t *pmd;
++	spinlock_t *ptl;
++	unsigned long next;
++
++	pmd = pmd_offset(pud, addr);
++	do {
++		next = pmd_addr_end(addr, end);
++		if (pmd_none(*pmd))
++			continue;
++		if (pmd_trans_huge(*pmd)) {
++			ptl = pmd_lock(mm, pmd);
++			pgtables[count++] =
++				pgtable_trans_huge_withdraw(mm, pmd);
++			spin_unlock(ptl);
++		}
++	} while (pmd++, addr = next, addr != end);
++}
++
++static int get_optimal_pgtable_node(int *count)
++{
++	int nid, total, max;
++
++	max = 0;
++	total = count[0];
++	for (nid = 1; nid < nr_node_ids; nid++) {
++		total += count[nid];
++		if (count[nid] > count[max])
++			max = nid;
++	}
++
++	return max;
++}
++
++static int calc_pte_pgtable_optimal_node(struct vm_area_struct *vma, pmd_t *pmd,
++					 unsigned long addr)
++{
++	pte_t *pte;
++	int nid, count[NUMA_NODE_NUM] = { 0 };
++	unsigned long end;
++
++	end = pmd_addr_end(addr, min(addr + PMD_SIZE, vma->vm_end));
++	pte = pte_offset_map(pmd, addr);
++	for (;;) {
++		if (pte_none(*pte))
++			goto next;
++
++		nid = pfn_to_nid(pte_pfn(*pte));
++		if (nid == NUMA_NO_NODE)
++			goto next;
++
++		count[nid]++;
++	next:
++		addr += PAGE_SIZE;
++		if (addr == end)
++			break;
++		pte++;
++	};
++
++	pte_unmap(pte);
++	count_vm_numa_events(NUMA_PTE_UPDATES, 1);
++	return get_optimal_pgtable_node(count);
++}
++
++static bool migrate_pte_pgtable(struct mm_struct *mm, pmd_t *pmd,
++				unsigned long addr, int *new_nid)
++{
++	pmd_t new_pmd;
++	int nid, source_nid;
++	bool result = false;
++	struct page *src, *dst;
++	struct vm_area_struct *vma;
++	spinlock_t *ptl;
++	struct mmu_notifier_range range;
++
++	vma = find_vma(mm, addr);
++	if (!vma)
++		return false;
++	nid = calc_pte_pgtable_optimal_node(vma, pmd, addr);
++	src = pfn_to_page(pmd_pfn(*pmd));
++	source_nid = page_to_nid(src);
++	/* check if we need to migrate at all */
++	if (likely(!misplaced_pgtable(src, nid)))
++		return false;
++	dst = alloc_pgtable_page(nid);
++	if (unlikely(!dst))
++		return false;
++
++	new_pmd =
++		__pmd(((pteval_t)page_to_pfn(dst) << PAGE_SHIFT) | _PAGE_TABLE);
++	smp_wmb();
++	mmap_read_unlock(mm);
++	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, NULL, mm, addr,
++				addr + PAGE_SIZE);
++	mmu_notifier_invalidate_range_start(
++		&range); /* prevent all accesses to page tables */
++	mmap_write_lock(mm);
++	/* lock the page-table */
++	ptl = pmd_lockptr(mm, pmd);
++	spin_lock(ptl);
++	/* verify if the tables has been updated somewhere */
++	if (mm_find_pmd(mm, addr) != pmd) {
++		printk(KERN_INFO "PMD modified in-between migration\n");
++		goto out;
++	}
++	/* invalidate the existing entry first */
++	pmdp_invalidate(vma, addr, pmd);
++	copy_pgtable(dst, src);
++	/* set_pmd(pmd, new_pmd); */
++	pmd_populate(mm, pmd, dst);
++	mmu_notifier_invalidate_range_end(
++		&range); /* prevent all accesses to page tables */
++	__free_page(src);
++	*new_nid = nid;
++	count_vm_numa_events(NUMA_PTE_UPDATES, 1);
++	result = true;
++out:
++	spin_unlock(ptl);
++	mmap_write_unlock(mm);
++	mmap_read_lock(mm);
++	return result;
++}
++
++static bool migrate_pmd_pgtable(struct mm_struct *mm, pud_t *pud,
++				unsigned long addr, int nid)
++{
++	int source_nid;
++	pmd_t *new_pmd;
++	pgtable_t *pgtables;
++	struct page *src, *dst;
++	struct vm_area_struct *vma;
++	unsigned long end;
++	spinlock_t *ptl;
++	struct mmu_notifier_range range;
++
++	vma = find_vma(mm, addr);
++	if (!vma)
++		return false;
++
++	end = pud_addr_end(addr, min(vma->vm_end, addr + PUD_SIZE));
++	src = pfn_to_page(pud_pfn(*pud));
++	source_nid = page_to_nid(src);
++	/* check if we need to migrate at all */
++	if (likely(!misplaced_pgtable(src, nid)))
++		return false;
++
++	dst = alloc_pgtable_page(nid);
++	if (unlikely(!dst))
++		return false;
++
++	pgtables = kmalloc(HPAGE_PMD_NR * sizeof(pgtable_t *), GFP_KERNEL);
++	if (unlikely(!pgtables))
++		return false;
++
++	smp_wmb();
++	mmap_read_unlock(mm);
++	mmap_write_lock(mm);
++	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, NULL, mm, addr,
++				end);
++	mmu_notifier_invalidate_range_start(&range);
++	ptl = pud_lockptr(mm, pud);
++	spin_lock(ptl);
++	/* verify if the tables has been updated somewhere */
++	if (mm_find_pud(mm, addr) != pud) {
++		printk(KERN_INFO "PMD modified in-between migration\n");
++		goto out;
++	}
++	/* we need to withdraw pgtables from this PMD page first */
++	withdraw_pmd_pgtables(mm, pud, addr, end, pgtables);
++	pud_clear(pud);
++	copy_pgtable(dst, src);
++	new_pmd = (pmd_t *)page_address(dst);
++	pud_populate(mm, pud, new_pmd);
++	deposit_pmd_pgtables(mm, pud, addr, end, pgtables);
++	flush_tlb_range(vma, addr, end);
++	mmu_notifier_invalidate_range_end(&range);
++	__free_page(src);
++	count_vm_numa_events(NUMA_PTE_UPDATES, 1);
++out:
++	spin_unlock(ptl);
++	mmap_write_unlock(mm);
++	mmap_read_lock(mm);
++	kfree(pgtables);
++	return true;
++}
++
++/*
++ * Scan and migrate the next level (PTE) first.
++ * This helps in determining the optimal placement of PMD pgtable.
++ * Return new node identifier if PMD pgtable is migrated to a different socket.
++ * Else, return the original node id.
++ */
++static int scan_pmd_range(struct mm_struct *mm, pud_t *pud, unsigned long addr,
++			  unsigned long end)
++{
++	pmd_t *pmd;
++	int old_nid, new_nid, count[NUMA_NODE_NUM] = { 0 };
++	unsigned long next, start = addr;
++
++	old_nid = pfn_to_nid(pud_pfn(*pud));
++	/*
++     * Process all the children first.
++     */
++	pmd = pmd_offset(pud, addr);
++	do {
++		next = pmd_addr_end(addr, end);
++		if (pmd_none(*pmd))
++			continue;
++
++		if (pmd_trans_huge(*pmd)) {
++			count[pfn_to_nid(pmd_pfn(*pmd))]++;
++			continue;
++		}
++		if (migrate_pte_pgtable(mm, pmd, addr, &new_nid))
++			count[new_nid]++;
++	} while (pmd++, addr = next, addr < end);
++	/*
++     * Align the PMD pgtable placement now.
++     */
++	count_vm_numa_events(NUMA_PTE_UPDATES, 1);
++	new_nid = get_optimal_pgtable_node(count);
++	if (migrate_pmd_pgtable(mm, pud, start, new_nid))
++		return new_nid;
++
++	return old_nid;
++}
++
++/*
++ * No support to migrate PUD pgtables yet.
++ */
++static void scan_pud_range(struct mm_struct *mm, p4d_t *p4d, unsigned long addr,
++			   unsigned long end)
++{
++	pud_t *pud;
++	unsigned long next;
++
++	pud = pud_offset(p4d, addr);
++	do {
++		next = pud_addr_end(addr, end);
++		if (pud_none_or_clear_bad(pud))
++			continue;
++
++		scan_pmd_range(mm, pud, addr, next);
++	} while (pud++, addr = next, addr < end);
++}
++
++static void scan_p4d_range(struct mm_struct *mm, pgd_t *pgd, unsigned long addr,
++			   unsigned long end)
++{
++	p4d_t *p4d;
++	unsigned long next;
++
++	p4d = p4d_offset(pgd, addr);
++	do {
++		next = p4d_addr_end(addr, end);
++		if (p4d_none_or_clear_bad(p4d))
++			continue;
++
++		scan_pud_range(mm, p4d, addr, next);
++	} while (p4d++, addr = next, addr < end);
++}
++
++static void scan_pgd_range(struct mm_struct *mm, unsigned long addr,
++			   unsigned long end)
++{
++	pgd_t *pgd;
++	unsigned long next;
++
++	pgd = pgd_offset(mm, addr);
++	do {
++		next = pgd_addr_end(addr, end);
++		if (pgd_none_or_clear_bad(pgd))
++			continue;
++
++		scan_p4d_range(mm, pgd, addr, next);
++	} while (pgd++, addr = next, addr < end);
++}
++
++static void migrate_ptes(struct mm_struct *mm)
++{
++	struct vm_area_struct *vma;
++	unsigned long start, end;
++
++	start = 0;
++	vma = find_vma(mm, start);
++	if (!vma) {
++		vma = mm->mmap;
++	}
++
++	for (; vma; vma = vma->vm_next) {
++		if (!vma_migratable(vma) || !vma_policy_mof(vma) ||
++		    is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_MIXEDMAP)) {
++			continue;
++		}
++		/* ignore shared library pages */
++		if (!vma->vm_mm ||
++		    (vma->vm_file &&
++		     (vma->vm_flags & (VM_READ | VM_WRITE)) == (VM_READ))) {
++			continue;
++		}
++
++		/* ignore inaccessible vmas */
++		if (!(vma->vm_flags & (VM_READ | VM_EXEC | VM_WRITE))) {
++			continue;
++		}
++
++		start = max(start, vma->vm_start);
++		end = vma->vm_end;
++		/*
++         * Scan the entire leftover range of the vma.
++         * We can optimize this later to migrate pgtables incrementally.
++         */
++		scan_pgd_range(mm, start, end);
++	}
++}
++/////////////////////////////// Pagetable Migration End/////////////////////////
++
++void print_mm_distribution(struct mm_slot *slot, struct mm_struct *mm)
++{
++	struct vm_area_struct *vma;
++	int err = 0;
++	unsigned long addr;
++	unsigned long start;
++	unsigned long end;
++	struct page *page;
++	int total_cnts[4] = { 0 };
++	int nid;
++
++	mmap_read_lock(mm);
++
++	for (vma = mm->mmap; vma; vma = vma->vm_next) {
++		start = vma->vm_start;
++		end = vma->vm_end;
++		// printk("<7>AdaptMD: print_mm_distribution: vma_flags: %lx, vma_size: %lu [INFO]\n",
++		// 	vma->vm_flags, (end - start) / PAGE_SIZE);
++		if (!(vma->vm_flags & VM_MERGEABLE) || !vma->anon_vma)
++			continue;
++		for (addr = start; addr < end && !err; addr += PAGE_SIZE) {
++			if (signal_pending(current))
++				err = -ERESTARTSYS;
++			else {
++				page = follow_page(vma, addr,
++						   FOLL_GET | FOLL_MIGRATION);
++				if (IS_ERR_OR_NULL(page))
++					break;
++				nid = page_to_nid(page);
++				total_cnts[nid]++;
++				put_page(page);
++			}
++		}
++		if (err)
++			goto error;
++	}
++	printk("<7>AdaptMD: print_mm_distribution: process%d: node0=%d, node1=%d, node2=%d, node3=%d\n",
++	       slot->mm->owner->pid, total_cnts[0], total_cnts[1],
++	       total_cnts[2], total_cnts[3]);
++	mmap_read_unlock(mm);
++	return;
++
++error:
++	printk("<7>AdaptMD: print_mm_distribution: [ERROR]\n");
++	mmap_read_unlock(mm);
++	return;
++}
++
++void print_mm_distribution_all(void)
++{
++	struct mm_slot *slot;
++	struct task_struct *task;
++	int task_node;
++	struct mm_struct *mm;
++	slot = &ksm_mm_head;
++	do {
++		spin_lock(&ksm_mmlist_lock);
++		slot = list_entry(slot->mm_list.next, struct mm_slot, mm_list);
++		spin_unlock(&ksm_mmlist_lock);
++		if (slot && slot != &ksm_mm_head) {
++			task = slot->mm->owner;
++			if (task) {
++				get_task_struct(task);
++				task_node = cpu_to_node(task_cpu(task));
++				if (!strcmp(task->comm, "qemu-system-x86")) {
++					mm = get_task_mm(task);
++					if (mm) {
++						print_mm_distribution(slot, mm);
++						mmput(mm);
++					}
++				}
++				put_task_struct(task);
++			}
++		}
++		cond_resched();
++	} while (slot != &ksm_mm_head);
++}
++
++static int unmerge_and_remove_rmap_items_mm(struct mm_slot *mm_slot,
++					    struct mm_struct *mm)
++{
++	struct vm_area_struct *vma;
++	int err = 0;
++
++	mmap_read_lock(mm);
++	for (vma = mm->mmap; vma; vma = vma->vm_next) {
++		if (ksm_test_exit(mm))
++			break;
++		if (!(vma->vm_flags & VM_MERGEABLE) || !vma->anon_vma)
++			continue;
++		err = unmerge_ksm_pages(vma, vma->vm_start, vma->vm_end);
++		if (err)
++			goto error;
++	}
++
++	remove_trailing_rmap_items(mm_slot, &mm_slot->rmap_list);
++
++	spin_lock(&ksm_mmlist_lock);
++	if (ksm_test_exit(mm)) {
++		hash_del(&mm_slot->link);
++		list_del(&mm_slot->mm_list);
++		spin_unlock(&ksm_mmlist_lock);
++
++		free_mm_slot(mm_slot);
++		clear_bit(MMF_VM_MERGEABLE, &mm->flags);
++		mmap_read_unlock(mm);
++		mmdrop(mm);
++	} else {
++		spin_unlock(&ksm_mmlist_lock);
++		mmap_read_unlock(mm);
++	}
++
++	return 0;
++
++error:
++	printk("<7>AdaptMD: unmerge_and_remove_rmap_items_mm: [ERROR]\n");
++	mmap_read_unlock(mm);
++	spin_lock(&ksm_mmlist_lock);
++	ksm_scan.mm_slot = &ksm_mm_head;
++	spin_unlock(&ksm_mmlist_lock);
++	return err;
++}
++
++static int migrate_vms_cpu_mem_pgtables(struct mm_slot *slot,
++					struct task_struct *task, int src_nid,
++					int des_nid)
++{
++	struct timespec64 start, end;
++	nodemask_t old_mask, new_mask;
++	const struct cpumask *mask_ptr;
++	struct mm_struct *mm;
++	int ret = -1;
++	nodes_clear(old_mask);
++	nodes_clear(new_mask);
++	node_set(src_nid, old_mask);
++	node_set(des_nid, new_mask);
++	ktime_get_ts64(&start);
++	mask_ptr = cpumask_of_node(des_nid);
++	sched_setaffinity(current->pid, mask_ptr);
++	ret = set_cpus_affinfity(task, mask_ptr);
++	mm = get_task_mm(task);
++	if (mm) {
++		// print_mm_distribution_all();
++		set_current_oom_origin();
++		unmerge_and_remove_rmap_items_mm(slot, mm);
++		clear_current_oom_origin();
++		mpol_rebind_mm(mm, &new_mask);
++		ret = do_migrate_pages(mm, &old_mask, &new_mask,
++				       MPOL_MF_MOVE_ALL);
++		mmap_read_lock(mm);
++		migrate_ptes(mm);
++		mmap_read_unlock(mm);
++		// print_mm_distribution_all();
++		mmput(mm);
++	}
++	ktime_get_ts64(&end);
++	return ret;
++}
++
++static int get_node_vcpu_num(int nid)
++{
++	int i, ret = 0;
++	const struct cpumask *mask_ptr;
++	mask_ptr = cpumask_of_node(nid);
++
++	for (i = 0; i < nr_cpu_ids; i++) {
++		if (cpumask_test_cpu(i, mask_ptr)) {
++			ret++;
++		}
++	}
++	return ret;
++}
++
++static int calc_migration_target_node(
++	struct mm_slot **migrate_group, int vm_nums, int group_no,
++	int same_vms_intra_node[NUMA_NODE_NUM][NUMA_NODE_NUM])
++{
++	int i, j, k, sum_mems, target_node = -1; //, max_migration_node;
++	int sum_vcpus = 0;
++	struct sysinfo node_mem_info;
++	int node_priori[MAX_NUMNODES] = { 0 };
++	u64 node_total, node_idle, max_idle_mem = 0;
++	u64 cur_node_cpu_idle[MAX_NUMNODES] = { 0 };
++	struct task_struct *task;
++
++	for (i = 0; i < ksm_nr_node_ids; i++) {
++		get_node_cpu_load(i, &node_total, &node_idle);
++		cur_node_cpu_idle[i] = 100 *
++				       (node_idle - node_cpu_load_info[i][1]) /
++				       (node_total - node_cpu_load_info[i][0]);
++		printk("<7>AdaptMD: func: %s, node %i cpu_load, cpu idle percentage=%lu\n",
++		       __func__, i, cur_node_cpu_idle[i]);
++	}
++
++	j = 1;
++	for (i = 0; i < ksm_nr_node_ids; i++) {
++		if (same_vms_intra_node[group_no][i] > j) {
++			j = same_vms_intra_node[group_no][i];
++			// target_node = i;
++			// node_priori[0]=i;
++		}
++	}
++	k = j;
++	j = 0;
++	for (; k >= 0; k--) { // sort nodes with priority
++		for (i = 0; i < ksm_nr_node_ids; i++) {
++			if (same_vms_intra_node[group_no][i] == k) {
++				node_priori[j] = i;
++				j += 1;
++			}
++		}
++	}
++
++	for (i = 0; i < ksm_nr_node_ids; i++) {
++		sum_mems = sum_vcpus = 0;
++		j = node_priori[i]; // suppose j as target node
++		for (k = 0; k < vm_nums; k++) {
++			if (migrate_group[k] != NULL &&
++			    migrate_group[k]->node_id != j) {
++				task = migrate_group[k]->mm->owner;
++				get_task_struct(task);
++				// printk("<7>AdaptMD: task pid=%d node_id=%d\n", task->pid, migrate_group[k]->node_id);
++				sum_vcpus += get_vm_vcpus(task);
++				sum_mems += get_mm_rss(migrate_group[k]->mm);
++				put_task_struct(task);
++			}
++		}
++		si_meminfo_node(&node_mem_info, j);
++		// printk("<7>AdaptMD: sum_vcpus=%d, sum_mems=%d, node %d freeram=%lu\n", sum_vcpus, sum_mems, j, node_mem_info.freeram);
++		if ((get_node_vcpu_num(j) *
++			     (cur_node_cpu_idle[j] +
++			      node_cpus_overload_threshold - 100) <
++		     100 * sum_vcpus) ||
++		    sum_mems > node_mem_info.freeram) {
++			printk("<7>AdaptMD: node %d can't fit requirement\n",
++			       j);
++			continue;
++		} else {
++			if (max_idle_mem < node_mem_info.freeram - sum_mems) {
++				max_idle_mem = node_mem_info.freeram - sum_mems;
++				target_node = j;
++			}
++		}
++	}
++	// printk("<7>AdaptMD: target migration NUMA node id=%d\n", target_node);
++	return target_node;
++}
++
++static int decide_and_migrate_vms(int *dedup_rate_nums,
++				  struct mm_slot *dedup_rate_slot[100][2],
++				  int vm_nums, int high_dup_rate_nums)
++{
++	int tmp, i, j, k, l, exist, group_nums = 0, ret = 0;
++	struct mm_slot *slot1;
++	struct mm_slot ***migrate_groups;
++	struct mm_slot **tmp_group;
++	int *migrate_node;
++	struct cpumask old_mask;
++	int same_vms_intra_node[NUMA_NODE_NUM][NUMA_NODE_NUM] = { 0 };
++
++	migrate_groups = (struct mm_slot ***)kcalloc(
++		vm_nums, sizeof(struct mm_slot **), GFP_KERNEL);
++	if (!migrate_groups) {
++		return 0;
++	}
++	j = 0;
++	slot1 = &ksm_mm_head;
++	do {
++		cond_resched();
++		spin_lock(&ksm_mmlist_lock);
++		slot1 = list_entry(slot1->mm_list.next, struct mm_slot,
++				   mm_list);
++		spin_unlock(&ksm_mmlist_lock);
++		if (slot1 == NULL || slot1 == &ksm_mm_head) {
++			break;
++		}
++		// printk("<7>AdaptMD: the migration group of VM process %d \n", slot1->mm->owner->pid);
++		tmp = 0;
++		tmp_group = (struct mm_slot **)kcalloc(
++			vm_nums, sizeof(struct mm_slot *), GFP_KERNEL);
++		for (i = 0; i < high_dup_rate_nums && dedup_rate_nums[i]; i++) {
++			if (dedup_rate_nums[i] != -1) {
++				if (slot1 == dedup_rate_slot[i][0]) {
++					exist = 0;
++					for (k = 0; k < vm_nums; k++) {
++						if (migrate_groups[k]) {
++							for (l = 0; l < vm_nums;
++							     l++) {
++								if (migrate_groups
++									    [k]
++									    [l]) {
++									if (slot1 ==
++									    migrate_groups
++										    [k]
++										    [l]) {
++										exist +=
++											1;
++									} else if (
++										dedup_rate_slot
++											[i]
++											[1] ==
++										migrate_groups
++											[k]
++											[l]) {
++										exist +=
++											10;
++									}
++								} else if (exist) {
++									dedup_rate_nums
++										[i] = -1;
++									switch (exist) {
++									case 11:
++										break;
++									case 10:
++										tmp++;
++										tmp_group[tmp] =
++											slot1;
++										break;
++									case 1:
++										tmp++;
++										tmp_group[tmp] = dedup_rate_slot
++											[i]
++											[1];
++										break;
++									}
++									goto next_loop;
++								} else {
++									break;
++								}
++							}
++						}
++					}
++					tmp_group[tmp] = dedup_rate_slot[i][1];
++					dedup_rate_nums[i] = -1;
++					tmp++;
++				} else if (slot1 == dedup_rate_slot[i][1]) {
++					exist = 0;
++					for (k = 0; k < vm_nums; k++) {
++						if (migrate_groups[k]) {
++							for (l = 0; l < vm_nums;
++							     l++) {
++								if (migrate_groups
++									    [k]
++									    [l]) {
++									if (slot1 ==
++									    migrate_groups
++										    [k]
++										    [l]) {
++										exist +=
++											1;
++									} else if (
++										dedup_rate_slot
++											[i]
++											[0] ==
++										migrate_groups
++											[k]
++											[l]) {
++										exist +=
++											10;
++									}
++								} else if (exist) {
++									dedup_rate_nums
++										[i] = -1;
++									switch (exist) {
++									case 11:
++										break;
++									case 10:
++										tmp++;
++										tmp_group[tmp] =
++											slot1;
++										break;
++									case 1:
++										tmp++;
++										tmp_group[tmp] = dedup_rate_slot
++											[i]
++											[0];
++										break;
++									}
++									goto next_loop;
++								} else {
++									break;
++								}
++							}
++						}
++					}
++					tmp_group[tmp] = dedup_rate_slot[i][0];
++					dedup_rate_nums[i] = -1;
++					tmp++;
++				}
++			}
++		}
++	next_loop:
++		if (tmp) {
++			tmp_group[tmp] = slot1;
++			migrate_groups[j] = tmp_group;
++			j++;
++			if (tmp == vm_nums - 1) {
++				break;
++			}
++		}
++	} while (slot1 != &ksm_mm_head);
++	group_nums = j;
++	printk("<7>AdaptMD: total %d migration group\n", group_nums);
++	group_nums = 0;
++	migrate_node = (int *)kcalloc(vm_nums + 1, sizeof(int), GFP_KERNEL);
++	tmp = 0;
++	for (i = 0; i < vm_nums; i++) {
++		if (migrate_groups[i]) {
++			for (j = 0; j < vm_nums; j++) {
++				migrate_node[j] = 0;
++			}
++			printk("<7>AdaptMD: migration group %d:\n", tmp);
++			tmp_group = migrate_groups[i];
++			for (j = 0; j < vm_nums; j++) {
++				if (tmp_group[j]) {
++					migrate_node[tmp_group[j]->node_id] +=
++						1;
++					migrate_node[vm_nums] += 1;
++					// printk("<7>AdaptMD: VM process %d, it's NUMA node id=%d\n", tmp_group[j]->mm->owner->pid, tmp_group[j]->node_id);
++					same_vms_intra_node
++						[i][tmp_group[j]->node_id] += 1;
++				}
++			}
++			if (ksm_nr_node_ids <= 4) {
++				k = -1;
++				for (j = 0; j < ksm_nr_node_ids; j++) {
++					if (same_vms_intra_node[i][j] > 1) {
++						k = i;
++					}
++				}
++				if (k < 0) {
++					k = calc_migration_target_node(
++						tmp_group, vm_nums, i,
++						same_vms_intra_node);
++					if (k < 0) {
++						printk("<7>AdaptMD: no suitable target node\n");
++						ret = -1;
++						continue;
++					}
++				}
++				printk("<7>AdaptMD: migration group %d, it's target node=%d\n",
++				       tmp, k);
++				l = 0;
++				for (j = 0; j < vm_nums && tmp_group[j]; j++) {
++					slot1 = tmp_group[j];
++					if (slot1->node_id != k) {
++						sched_getaffinity(current->pid,
++								  &old_mask);
++						migrate_vms_cpu_mem_pgtables(
++							slot1, slot1->mm->owner,
++							slot1->node_id, k);
++						if (ret != -1) {
++							ret++;
++						}
++						sched_setaffinity(current->pid,
++								  &old_mask);
++						slot1->node_id = k;
++					}
++				}
++			}
++			tmp++;
++		}
++	}
++	l = 0;
++	if (ksm_nr_node_ids > 4) {
++		for (i = 0; i < ksm_nr_node_ids; i++) {
++			for (j = 0; j < group_nums; j++) {
++				tmp_group = migrate_groups[j];
++				if (tmp_group) {
++					for (l = 0; l < vm_nums && tmp_group[l];
++					     l++) {
++						slot1 = tmp_group[l];
++						if (slot1->node_id == i) {
++							k = (j + 1) %
++							    ksm_nr_node_ids;
++							if (k != i) {
++								migrate_vms_cpu_mem_pgtables(
++									slot1,
++									slot1->mm
++										->owner,
++									i, k);
++								if (ret != -1) {
++									ret++;
++								}
++								slot1->node_id =
++									k;
++								l++;
++							}
++						}
++					}
++				}
++			}
++			if (i - 1 < 0) {
++				k = i - 1 + ksm_nr_node_ids;
++			} else {
++				k = i - 1;
++			}
++			printk("<7>AdaptMD: migrate group %d\n", k);
++			tmp_group = migrate_groups[k];
++			if (tmp_group) {
++				for (j = 0; j < vm_nums && tmp_group[j]; j++) {
++					slot1 = tmp_group[j];
++					if (slot1->node_id != i) {
++						ret = migrate_vms_cpu_mem_pgtables(
++							slot1, slot1->mm->owner,
++							slot1->node_id, i);
++						if (ret != -1) {
++							ret++;
++						}
++						slot1->node_id = i;
++						l++;
++					}
++				}
++			}
++			migrate_groups[k] = NULL;
++		}
++	}
++	for (i = 0; i < vm_nums; i++) {
++		if (migrate_groups[i]) {
++			kfree(migrate_groups[i]);
++		}
++	}
++	kfree(migrate_groups);
++	kfree(migrate_node);
++	return ret;
++}
++
++static int migrate_vms_ksm(void)
++{
++	struct timespec64 migration_start, migration_end;
++	ktime_get_ts64(&migration_start);
++	int node_vm_nums[NUMA_NODE_NUM] = { 0 };
++	int tmp, i, j, count; //
++	unsigned long seqnr = ksm_scan.seqnr - 1;
++	struct mm_slot *slot;
++	unsigned int *bloom_array;
++	struct page *page; //, *tree_page;
++	struct list_head *pos, *next, *pos2, *next2;
++	struct rmap_item *rmap_item;
++	unsigned int checksum;
++	struct migrate_bloom_info *migrate_bloom_info, *migrate_bloom_info2;
++	int vm_nums = 0;
++	int tmp_dedup_rate;
++	int dedup_rate_min = similarity_threshold;
++	int dedup_rate_nums[100] = { 0 };
++	struct mm_slot *dedup_rate_slot[100][2] = { 0 };
++	u64 node_idle = 0, node_total = 0;
++	struct task_struct *task;
++	int ret = 0;
++	// get node CPU load of all NUMA nodes
++	for (i = 0; i < ksm_nr_node_ids; i++) {
++		get_node_cpu_load(i, &node_total, &node_idle);
++		node_cpu_load_info[i][0] = node_total;
++		node_cpu_load_info[i][1] = node_idle;
++	}
++
++	slot = &ksm_mm_head;
++	do {
++		spin_lock(&ksm_mmlist_lock);
++		slot = list_entry(slot->mm_list.next, struct mm_slot, mm_list);
++		spin_unlock(&ksm_mmlist_lock);
++		if (slot && slot != &ksm_mm_head) {
++			vm_nums++;
++			task = slot->mm->owner;
++			get_task_struct(task);
++			slot->node_id = cpu_to_node(task_cpu(task));
++			put_task_struct(task);
++			node_vm_nums[slot->node_id] += 1;
++		}
++		cond_resched();
++	} while (slot != &ksm_mm_head);
++
++	printk("<7>AdaptMD: total %d VMs in host...\n", vm_nums);
++	tmp = 0;
++	for (i = 0; i < nr_node_ids; i++) {
++		if (node_vm_nums[i]) {
++			printk("<7>AdaptMD: NUMA node %d has %d VMs\n", i,
++			       node_vm_nums[i]);
++			tmp++;
++		}
++	}
++	if (tmp <= 1) {
++		printk("<7>AdaptMD: all VMs in the same NUMA node, exit migration\n");
++		return 0;
++	}
++	for (i = 0; i < nr_node_ids; i++) {
++		if (node_vm_nums[i]) {
++			pos = kcalloc(1, sizeof(struct list_head), GFP_KERNEL);
++			if (!pos) {
++				goto free_6;
++			}
++			INIT_LIST_HEAD(pos);
++			bloom_list[i] = pos;
++		} else {
++			bloom_list[i] = NULL;
++		}
++	}
++	slot = &ksm_mm_head;
++	do {
++		cond_resched();
++		spin_lock(&ksm_mmlist_lock);
++		slot = list_entry(slot->mm_list.next, struct mm_slot, mm_list);
++		spin_unlock(&ksm_mmlist_lock);
++		if (slot == NULL || slot == &ksm_mm_head) {
++			break;
++		}
++		tmp = slot->node_id;
++		if (bloom_list[tmp]) {
++			// 32G =2^23 pages, one page per bit, 2^23bit=2^20Byte
++			bloom_array = vzalloc(1 << 20);
++			if (!bloom_array) {
++				printk("<7>AdaptMD: bloom array create failed\n");
++				goto free_5;
++			}
++			migrate_bloom_info = alloc_migrate_bloom_info();
++			if (!migrate_bloom_info) {
++				printk("<7>AdaptMD: migration array create failed\n");
++				goto free_4;
++			}
++			migrate_bloom_info->bloom_array = bloom_array;
++			migrate_bloom_info->mm_slot = slot;
++			migrate_bloom_info->node_id = tmp;
++			if (bloom_list[tmp]) {
++				list_add_tail(&(migrate_bloom_info->list),
++					      bloom_list[tmp]);
++			}
++		}
++	} while (slot != &ksm_mm_head);
++	seqnr = ksm_scan.seqnr;
++	slot = ksm_scan.mm_slot = &ksm_mm_head;
++	while (ksm_scan.seqnr <= seqnr) {
++		cond_resched();
++		rmap_item = scan_get_next_rmap_item(&page);
++
++		if (!rmap_item) {
++			if (ksm_scan.seqnr > seqnr) {
++				ksm_scan.seqnr -= 1;
++			}
++			break;
++		}
++		if (slot != ksm_scan.mm_slot) {
++			slot = ksm_scan.mm_slot;
++			tmp = slot->node_id;
++			if (bloom_list[tmp] == NULL) {
++				spin_lock(&ksm_mmlist_lock);
++				ksm_scan.mm_slot =
++					list_entry(slot->mm_list.next,
++						   struct mm_slot, mm_list);
++				spin_unlock(&ksm_mmlist_lock);
++				continue;
++			} else {
++				list_for_each_safe (pos, next,
++						    bloom_list[tmp]) {
++					migrate_bloom_info = list_entry(
++						pos, struct migrate_bloom_info,
++						list);
++					if (slot ==
++					    migrate_bloom_info->mm_slot) {
++						bloom_array =
++							migrate_bloom_info
++								->bloom_array;
++						BUG_ON(bloom_array == NULL);
++						break;
++					}
++				}
++			}
++		}
++		if (page_stable_node(page)) {
++			checksum = rmap_item->oldchecksum;
++		} else {
++			tmp = rmap_item->address & UNSTABLE_FLAG;
++			remove_rmap_item_from_tree(rmap_item);
++			if (tmp) {
++				checksum = rmap_item->oldchecksum;
++			} else {
++				checksum = calc_checksum(page);
++			}
++		}
++		set_bloom_array_migration(bloom_array, checksum, 1, 0x7fffff);
++		put_page(page);
++	}
++
++	printk("<7>AdaptMD: the similarity between VMs in same NUMA nodes...\n");
++	printk("<7>AdaptMD: VM process 1--VM process 2--same pages number--similarity rate\n");
++	tmp = 0;
++	for (i = 0; i < nr_node_ids; i++) {
++		if (bloom_list[i]) {
++			for (pos = (bloom_list[i])->next, next = pos->next;
++			     pos != (bloom_list[i]);
++			     pos = next, next = pos->next) {
++				cond_resched();
++				migrate_bloom_info = list_entry(
++					pos, struct migrate_bloom_info, list);
++				slot = migrate_bloom_info->mm_slot;
++				for (pos2 = pos->next, next2 = pos2->next;
++				     pos2 != (bloom_list[i]);
++				     pos2 = next2, next2 = pos2->next) {
++					migrate_bloom_info2 = list_entry(
++						pos2, struct migrate_bloom_info,
++						list);
++					if (migrate_bloom_info2->mm_slot &&
++					    slot != migrate_bloom_info2
++							    ->mm_slot) {
++						checksum = cmp_bloom_array(
++							migrate_bloom_info
++								->bloom_array,
++							migrate_bloom_info2
++								->bloom_array,
++							262144);
++						tmp_dedup_rate = div_u64(
++							checksum * 1000,
++							min_num(slot->total_rmap_items,
++								migrate_bloom_info2
++									->mm_slot
++									->total_rmap_items));
++						// Note that the real similarity rate needs to be divided by 1000
++						printk("<7>AdaptMD: %u--%u--%u--%u\n",
++						       slot->mm->owner->pid,
++						       migrate_bloom_info2
++							       ->mm_slot->mm
++							       ->owner->pid,
++						       checksum,
++						       tmp_dedup_rate);
++						if (tmp_dedup_rate >=
++						    dedup_rate_min) {
++							dedup_rate_nums[tmp] =
++								tmp_dedup_rate;
++							dedup_rate_slot[tmp][0] =
++								slot;
++							dedup_rate_slot[tmp][1] =
++								migrate_bloom_info2
++									->mm_slot;
++							tmp++;
++						}
++					}
++				}
++			}
++		}
++	}
++	count = tmp;
++	printk("<7>AdaptMD: the similarity between VMs in different NUMA nodes...\n");
++	printk("<7>AdaptMD: VM process 1--VM process 2--same pages number--similarity rate\n");
++	for (i = 0; i < nr_node_ids; i++) {
++		if (bloom_list[i]) {
++			list_for_each_safe (pos, next, bloom_list[i]) {
++				migrate_bloom_info = list_entry(
++					pos, struct migrate_bloom_info, list);
++				slot = migrate_bloom_info->mm_slot;
++				if (slot) {
++					for (j = i + 1; j < nr_node_ids; j++) {
++						cond_resched();
++						checksum = 0;
++						if (bloom_list[j]) {
++							list_for_each_safe (
++								pos2, next2,
++								bloom_list[j]) {
++								migrate_bloom_info2 = list_entry(
++									pos2,
++									struct migrate_bloom_info,
++									list);
++								if (migrate_bloom_info2
++									    ->mm_slot &&
++								    slot != migrate_bloom_info2
++										    ->mm_slot) {
++									checksum = cmp_bloom_array(
++										migrate_bloom_info
++											->bloom_array,
++										migrate_bloom_info2
++											->bloom_array,
++										262144);
++									// Note that the real similarity rate needs to be divided by 1000
++									tmp_dedup_rate = div_u64(
++										checksum *
++											1000,
++										min_num(slot->total_rmap_items,
++											migrate_bloom_info2
++												->mm_slot
++												->total_rmap_items));
++									printk("<7>AdaptMD: %u--%u--%u--%u\n",
++									       slot->mm->owner
++										       ->pid,
++									       migrate_bloom_info2
++										       ->mm_slot
++										       ->mm
++										       ->owner
++										       ->pid,
++									       checksum,
++									       tmp_dedup_rate);
++									if (tmp_dedup_rate >=
++									    dedup_rate_min) {
++										dedup_rate_nums
++											[tmp] = tmp_dedup_rate;
++										dedup_rate_slot
++											[tmp]
++											[0] = slot;
++										dedup_rate_slot
++											[tmp]
++											[1] = migrate_bloom_info2
++												      ->mm_slot;
++										tmp++;
++									}
++								} else {
++									break;
++								}
++							}
++						}
++					}
++				}
++			}
++		}
++	}
++
++	printk("<7>AdaptMD: VM pairs whose similarity exceeds the threshold..\n");
++	printk("<7>AdaptMD: VM process 1--VM Process 2--Similarity rate\n");
++	for (i = 0; i < 100; i++) {
++		if (dedup_rate_nums[i]) {
++			printk("<7>AdaptMD: %d---%d---%d\n",
++			       dedup_rate_slot[i][0]->mm->owner->pid,
++			       dedup_rate_slot[i][1]->mm->owner->pid,
++			       dedup_rate_nums[i]);
++		}
++	}
++
++	if (!dedup_rate_nums[0] || count == tmp) {
++		printk("<7>AdaptMD: No high similarity between VMs, exit migration...\n");
++		goto free_4;
++	}
++	ret = decide_and_migrate_vms(dedup_rate_nums, dedup_rate_slot, vm_nums,
++				     tmp);
++free_4:
++	for (i = 0; i < nr_node_ids && bloom_list[i]; i++) {
++		list_for_each_safe (pos, next, bloom_list[i]) {
++			migrate_bloom_info = list_entry(
++				pos, struct migrate_bloom_info, list);
++			if (migrate_bloom_info &&
++			    migrate_bloom_info->bloom_array) {
++				vfree(migrate_bloom_info->bloom_array);
++				list_del(&(migrate_bloom_info->list));
++				free_migrate_bloom_info(migrate_bloom_info);
++			}
++		}
++	}
++free_5:
++	for (i = 0; i < nr_node_ids && bloom_list[i]; i++) {
++		list_for_each_safe (pos, next, bloom_list[i]) {
++			migrate_bloom_info = list_entry(
++				pos, struct migrate_bloom_info, list);
++			if (migrate_bloom_info) {
++				free_migrate_bloom_info(migrate_bloom_info);
++			}
++		}
++	}
++free_6:
++	for (i = 0; i < nr_node_ids && bloom_list[i]; i++) {
++		kfree(bloom_list[i]);
++	}
++
++	ktime_get_ts64(&migration_end);
++	printk("<7>AdaptMD: seqnr=%lu time spent: %lld us\n", ksm_scan.seqnr,
++	       (round_end.tv_sec - round_start.tv_sec) * 1000000LL +
++		       (round_end.tv_nsec - round_start.tv_nsec) /
++			       1000LL); // Convert ns to us
++	return ret;
++}
++
++static int adaptive_ksm(void)
++{
++	int ret = 0;
++	if (ksm_scan.seqnr == 0) {
++		return 2;
++	}
++	ret = migrate_vms_ksm();
++	printk("<7>AdaptMD: func:%s, migrate_vms_ksm ret val=%d\n", __func__,
++	       ret);
++	if (ret == 0 ||
++	    ret >= 1) { // No highly similarity VMs, just perform global dedup
++		ksm_merge_across_nodes = 1;
++		return 0;
++	}
++	return 1; // Highly similarity VMs exist, but resource requirements can't be fit.
++}
++
+ static int ksm_scan_thread(void *nothing)
+ {
++	int ret, i, j, size;
++	int mem_usage_high_seqnr = -1;
++	unsigned long adapt_next_seqnr = -1;
++	struct rb_root *buf;
++	int dedup_strategy = -1;
++	unsigned long next_update_merge_across = -1;
+ 	unsigned int sleep_ms;
+ 
+ 	set_freezable();
+ 	set_user_nice(current, 5);
+ 
++	if (nr_node_ids > 1 && ksm_merge_across_nodes == 0 &&
++	    (root_stable_tree == one_stable_tree)) {
++		buf = kcalloc(nr_node_ids + nr_node_ids, sizeof(*buf),
++			      GFP_KERNEL);
++		if (buf) {
++			root_stable_tree = buf;
++			root_unstable_tree = buf + nr_node_ids;
++			/* Stable tree is empty but not the unstable */
++			root_unstable_tree[0] = one_unstable_tree[0];
++			ksm_nr_node_ids = nr_node_ids;
++		} else {
++			printk("<7>AdaptMD: create stable/unstable trees failed...\n");
++			return 0;
++		}
++	} else {
++		ksm_merge_across_nodes = 1;
++	}
++	ktime_get_ts64(&round_start);
+ 	while (!kthread_should_stop()) {
+ 		mutex_lock(&ksm_thread_mutex);
+ 		wait_while_offlining();
+-		if (ksmd_should_run())
++		if (ksmd_should_run()) {
++			if (ksm_scan.seqnr > next_update_merge_across) {
++				ksm_merge_across_nodes =
++					global_user_merge_across_nodes;
++			}
++			if (ksm_merge_across_nodes || ksm_nr_node_ids <= 1 ||
++			    (ksm_merge_across_nodes == 0 &&
++			     ksm_adaptive_dedup ==
++				     0)) { // just one NUMA node or global dedup is enabled or just enable local dedup
++				ret = 0;
++			} else if ((ksm_adaptive_dedup == 1) &&
++				   (adapt_next_seqnr == -1 ||
++				    ksm_scan.seqnr > adapt_next_seqnr)) {
++				if (ksm_scan.seqnr == 0) {
++					ret = 0;
++				} else {
++					ret = adaptive_ksm();
++					if (ret == 0) {
++						next_update_merge_across =
++							ksm_scan.seqnr + 3;
++					} else if (ret == 1) {
++						dedup_strategy = 1;
++					}
++					adapt_next_seqnr =
++						ksm_adaptive_interval +
++						ksm_scan.seqnr;
++				}
++			} else {
++				if (ksm_adaptive_dedup ==
++				    2) { // just hotness-aware deduplication
++					ret = 1;
++				} else if (ksm_adaptive_dedup ==
++					   3) { // just similarity-based migration deduplication
++					ret = 2;
++				} else {
++					if (dedup_strategy != -1)
++						ret = 1;
++					else
++						ret = 0;
++				}
++			}
++			if (ret == 0 ||
++			    (ksm_adaptive_dedup == 3 &&
++			     (mem_usage_high_seqnr != -1 &&
++			      mem_usage_high_seqnr + ksm_migrate_vms_interval !=
++				      ksm_scan.seqnr))) {
+ 			ksm_do_scan(ksm_thread_pages_to_scan);
++			} else {
++				if (ret == 2 &&
++				    (mem_usage_high_seqnr == -1 ||
++				     mem_usage_high_seqnr +
++						     ksm_migrate_vms_interval ==
++					     ksm_scan.seqnr)) {
++					printk("<7>AdaptMD: similarity-based dedup start..\n");
++					migrate_vms_ksm();
++					mem_usage_high_seqnr =
++						ksm_scan.seqnr +
++						ksm_migrate_vms_interval;
++					printk("<7>AdaptMD: similarity-based dedup end..\n");
++				} else {
++					if (ctl_flag == 0) {
++						printk("<7>AdaptMD: the first time of hotness-aware dedup\n");
++						ctl_flag = 1;
++						if (ksm_nr_node_ids == 2) {
++							size = NUMA_2_NODE_BLOOM_SIZE >>
++							       3;
++						} else if (ksm_nr_node_ids ==
++							   4) {
++							size = NUMA_4_NODE_BLOOM_SIZE >>
++							       3;
++						}
++						for (i = 0; i < nr_node_ids;
++						     i++) {
++							bitmap[i] =
++								(int *)vzalloc(
++									size +
++									4);
++							if (!bitmap[i]) {
++								printk("<7>AdaptMD: call vzalloc to allocate bitmap failed\n");
++								ctl_flag = 0;
++								for (j = 0;
++								     j < i;
++								     j++) {
++									if (bitmap[j]) {
++										vfree(bitmap[j]);
++									}
++								}
++								break;
++							}
++						}
++						ctl_flag = 9;
++					}
++					hotness_aware_ksm();
++				}
++			}
++		}
+ 		mutex_unlock(&ksm_thread_mutex);
+ 
+ 		try_to_freeze();
+ 
+ 		if (ksmd_should_run()) {
+ 			sleep_ms = READ_ONCE(ksm_thread_sleep_millisecs);
+-			wait_event_interruptible_timeout(ksm_iter_wait,
+-				sleep_ms != READ_ONCE(ksm_thread_sleep_millisecs),
++			wait_event_interruptible_timeout(
++				ksm_iter_wait,
++				sleep_ms !=
++					READ_ONCE(ksm_thread_sleep_millisecs),
+ 				msecs_to_jiffies(sleep_ms));
+ 		} else {
+ 			wait_event_freezable(ksm_thread_wait,
+-				ksmd_should_run() || kthread_should_stop());
++					     ksmd_should_run() ||
++						     kthread_should_stop());
++			ktime_get_ts64(&round_start);
++			mem_usage_high_seqnr = -1;
++			adapt_next_seqnr = -1;
+ 		}
+ 	}
++	for (i = 0; i < ksm_nr_node_ids; i++) {
++		vfree(bitmap[i]);
++	}
++	adapt_next_seqnr = -1;
++	mem_usage_high_seqnr = -1;
+ 	return 0;
+ }
+ 
+@@ -2445,9 +4651,9 @@
+ 		/*
+ 		 * Be somewhat over-protective for now!
+ 		 */
+-		if (*vm_flags & (VM_MERGEABLE | VM_SHARED  | VM_MAYSHARE   |
+-				 VM_PFNMAP    | VM_IO      | VM_DONTEXPAND |
+-				 VM_HUGETLB | VM_MIXEDMAP))
++		if (*vm_flags &
++		    (VM_MERGEABLE | VM_SHARED | VM_MAYSHARE | VM_PFNMAP |
++		     VM_IO | VM_DONTEXPAND | VM_HUGETLB | VM_MIXEDMAP))
+ 			return 0;		/* just ignore the advice */
+ 
+ 		if (vma_is_dax(vma))
+@@ -2567,14 +4773,14 @@
+ }
+ 
+ struct page *ksm_might_need_to_copy(struct page *page,
+-			struct vm_area_struct *vma, unsigned long address)
++				    struct vm_area_struct *vma,
++				    unsigned long address)
+ {
+ 	struct anon_vma *anon_vma = page_anon_vma(page);
+ 	struct page *new_page;
+ 
+ 	if (PageKsm(page)) {
+-		if (page_stable_node(page) &&
+-		    !(ksm_run & KSM_RUN_UNMERGE))
++		if (page_stable_node(page) && !(ksm_run & KSM_RUN_UNMERGE))
+ 			return page;	/* no need to copy it */
+ 	} else if (!anon_vma) {
+ 		return page;		/* no need to copy it */
+@@ -2624,13 +4830,14 @@
+ 		struct anon_vma_chain *vmac;
+ 		struct vm_area_struct *vma;
+ 
+-		cond_resched();
++		// cond_resched();
+ 		anon_vma_lock_read(anon_vma);
+-		anon_vma_interval_tree_foreach(vmac, &anon_vma->rb_root,
+-					       0, ULONG_MAX) {
++		anon_vma_interval_tree_foreach(vmac, &anon_vma->rb_root, 0,
++					       ULONG_MAX)
++		{
+ 			unsigned long addr;
+ 
+-			cond_resched();
++			// cond_resched();
+ 			vma = vmac->vma;
+ 
+ 			/* Ignore the stable/unstable/sqnr flags */
+@@ -2676,7 +4883,8 @@
+ 
+ 	stable_node = page_stable_node(newpage);
+ 	if (stable_node) {
+-		VM_BUG_ON_PAGE(stable_node->kpfn != page_to_pfn(oldpage), oldpage);
++		VM_BUG_ON_PAGE(stable_node->kpfn != page_to_pfn(oldpage),
++			       oldpage);
+ 		stable_node->kpfn = page_to_pfn(newpage);
+ 		/*
+ 		 * newpage->mapping was set in advance; now we need smp_wmb()
+@@ -2705,8 +4913,7 @@
+ 					 unsigned long start_pfn,
+ 					 unsigned long end_pfn)
+ {
+-	if (stable_node->kpfn >= start_pfn &&
+-	    stable_node->kpfn < end_pfn) {
++	if (stable_node->kpfn >= start_pfn && stable_node->kpfn < end_pfn) {
+ 		/*
+ 		 * Don't get_ksm_page, page has already gone:
+ 		 * which is why we keep kpfn instead of page*
+@@ -2731,8 +4938,8 @@
+ 						    end_pfn);
+ 	}
+ 
+-	hlist_for_each_entry_safe(dup, hlist_safe,
+-				  &stable_node->hlist, hlist_dup) {
++	hlist_for_each_entry_safe (dup, hlist_safe, &stable_node->hlist,
++				   hlist_dup) {
+ 		VM_BUG_ON(!is_stable_node_dup(dup));
+ 		stable_node_dup_remove_range(dup, start_pfn, end_pfn);
+ 	}
+@@ -2754,10 +4961,9 @@
+ 		node = rb_first(root_stable_tree + nid);
+ 		while (node) {
+ 			stable_node = rb_entry(node, struct stable_node, node);
+-			if (stable_node_chain_remove_range(stable_node,
+-							   start_pfn, end_pfn,
+-							   root_stable_tree +
+-							   nid))
++			if (stable_node_chain_remove_range(
++				    stable_node, start_pfn, end_pfn,
++				    root_stable_tree + nid))
+ 				node = rb_first(root_stable_tree + nid);
+ 			else
+ 				node = rb_next(node);
+@@ -2854,6 +5060,236 @@
+ }
+ KSM_ATTR(sleep_millisecs);
+ 
++/*ksm_migrate_vms_interval*/
++static ssize_t migrate_vms_interval_show(struct kobject *kobj,
++					 struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", ksm_migrate_vms_interval);
++}
++
++static ssize_t migrate_vms_interval_store(struct kobject *kobj,
++					  struct kobj_attribute *attr,
++					  const char *buf, size_t count)
++{
++	unsigned long interval;
++	int err;
++
++	err = kstrtoul(buf, 10, &interval);
++	if (err || interval <= 0 || interval > UINT_MAX)
++		return -EINVAL;
++
++	ksm_migrate_vms_interval = interval;
++
++	return count;
++}
++KSM_ATTR(migrate_vms_interval);
++static ssize_t adaptive_interval_show(struct kobject *kobj,
++				      struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", ksm_adaptive_interval);
++}
++
++static ssize_t adaptive_interval_store(struct kobject *kobj,
++				       struct kobj_attribute *attr,
++				       const char *buf, size_t count)
++{
++	unsigned long interval;
++	int err;
++
++	err = kstrtoul(buf, 10, &interval);
++	if (err || interval <= 0 || interval > UINT_MAX)
++		return -EINVAL;
++
++	ksm_adaptive_interval = interval;
++
++	return count;
++}
++KSM_ATTR(adaptive_interval);
++
++static ssize_t active_threshold_show(struct kobject *kobj,
++				     struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", active_threshold);
++}
++
++static ssize_t active_threshold_store(struct kobject *kobj,
++				      struct kobj_attribute *attr,
++				      const char *buf, size_t count)
++{
++	unsigned long threshold;
++	int err;
++
++	err = kstrtoul(buf, 10, &threshold);
++	if (err || threshold > UINT_MAX || threshold <= 0)
++		return -EINVAL;
++
++	active_threshold = threshold;
++
++	return count;
++}
++KSM_ATTR(active_threshold);
++static ssize_t similarity_threshold_show(struct kobject *kobj,
++					 struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", similarity_threshold);
++}
++
++static ssize_t similarity_threshold_store(struct kobject *kobj,
++					  struct kobj_attribute *attr,
++					  const char *buf, size_t count)
++{
++	unsigned long threshold;
++	int err;
++
++	err = kstrtoul(buf, 10, &threshold);
++	if (err || threshold > UINT_MAX || threshold <= 0)
++		return -EINVAL;
++
++	similarity_threshold = threshold;
++
++	return count;
++}
++KSM_ATTR(similarity_threshold);
++
++static ssize_t use_bloom_filter_show(struct kobject *kobj,
++				     struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", use_bloom_filter);
++}
++
++static ssize_t use_bloom_filter_store(struct kobject *kobj,
++				      struct kobj_attribute *attr,
++				      const char *buf, size_t count)
++{
++	int err;
++	unsigned long enable;
++
++	err = kstrtoul(buf, 10, &enable);
++	if (err || enable > UINT_MAX)
++		return -EINVAL;
++
++	use_bloom_filter = enable;
++
++	return count;
++}
++KSM_ATTR(use_bloom_filter);
++
++static ssize_t enable_adaptive_dedup_show(struct kobject *kobj,
++					  struct kobj_attribute *attr,
++					  char *buf)
++{
++	return sprintf(buf, "%u\n", ksm_adaptive_dedup);
++}
++static ssize_t enable_adaptive_dedup_store(struct kobject *kobj,
++					   struct kobj_attribute *attr,
++					   const char *buf, size_t count)
++{
++	int err;
++	unsigned long enable;
++
++	err = kstrtoul(buf, 10, &enable);
++	if (err || enable > UINT_MAX)
++		return -EINVAL;
++
++	ksm_adaptive_dedup = enable;
++
++	return count;
++}
++KSM_ATTR(enable_adaptive_dedup);
++
++static ssize_t use_one_hash_show(struct kobject *kobj,
++				 struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", use_one_hash);
++}
++static ssize_t use_one_hash_store(struct kobject *kobj,
++				  struct kobj_attribute *attr, const char *buf,
++				  size_t count)
++{
++	int err;
++	unsigned long enable;
++
++	err = kstrtoul(buf, 10, &enable);
++	if (err || enable > UINT_MAX)
++		return -EINVAL;
++
++	use_one_hash = enable;
++
++	return count;
++}
++KSM_ATTR(use_one_hash);
++/*
++static ssize_t hash_page_contend_show(struct kobject *kobj,
++ struct kobj_attribute *attr, char *buf)
++{
++return sprintf(buf, "%u\n", hash_page_contend);
++}
++static ssize_t hash_page_contend_store(struct kobject *kobj,
++  struct kobj_attribute *attr,
++  const char *buf, size_t count)
++{
++int err;
++unsigned long enable;
++
++err = kstrtoul(buf, 10, &enable);
++if (err || enable > UINT_MAX)
++return -EINVAL;
++
++hash_page_contend = enable;
++
++return count;
++}
++KSM_ATTR(hash_page_contend);
++*/
++static ssize_t node_cpus_overload_threshold_show(struct kobject *kobj,
++						 struct kobj_attribute *attr,
++						 char *buf)
++{
++	return sprintf(buf, "%u\n", node_cpus_overload_threshold);
++}
++
++static ssize_t node_cpus_overload_threshold_store(struct kobject *kobj,
++						  struct kobj_attribute *attr,
++						  const char *buf, size_t count)
++{
++	int err;
++	long cpus_overload_threshold;
++
++	err = kstrtoul(buf, 10, &cpus_overload_threshold);
++	if (err || cpus_overload_threshold > UINT_MAX ||
++	    cpus_overload_threshold < 0)
++		return -EINVAL;
++
++	node_cpus_overload_threshold = cpus_overload_threshold;
++
++	return count;
++}
++KSM_ATTR(node_cpus_overload_threshold);
++/*
++static ssize_t node_mem_overload_threshold_show(struct kobject *kobj,
++		   struct kobj_attribute *attr, char *buf)
++{
++return sprintf(buf, "%u\n", node_mem_overload_threshold);
++}
++
++static ssize_t node_mem_overload_threshold_store(struct kobject *kobj,
++			struct kobj_attribute *attr,
++			const char *buf, size_t count)
++{
++int err;
++long mem_overload_threshold;
++
++err = kstrtoul(buf, 10, &mem_overload_threshold);
++if (err || mem_overload_threshold > UINT_MAX || mem_overload_threshold < 0)
++return -EINVAL;
++
++node_mem_overload_threshold = mem_overload_threshold;
++
++return count;
++}
++KSM_ATTR(node_mem_overload_threshold);
++*/
++
+ static ssize_t pages_to_scan_show(struct kobject *kobj,
+ 				  struct kobj_attribute *attr, char *buf)
+ {
+@@ -2861,8 +5297,8 @@
+ }
+ 
+ static ssize_t pages_to_scan_store(struct kobject *kobj,
+-				   struct kobj_attribute *attr,
+-				   const char *buf, size_t count)
++				   struct kobj_attribute *attr, const char *buf,
++				   size_t count)
+ {
+ 	int err;
+ 	unsigned long nr_pages;
+@@ -2888,6 +5324,8 @@
+ {
+ 	int err;
+ 	unsigned long flags;
++	long size;
++	int i, j;
+ 
+ 	err = kstrtoul(buf, 10, &flags);
+ 	if (err || flags > UINT_MAX)
+@@ -2895,6 +5333,13 @@
+ 	if (flags > KSM_RUN_UNMERGE)
+ 		return -EINVAL;
+ 
++	if (ksm_nr_node_ids == 2) {
++		size = NUMA_2_NODE_BLOOM_SIZE >> 5;
++	} else if (ksm_nr_node_ids == 4) {
++		size = NUMA_4_NODE_BLOOM_SIZE >> 5;
++	} else {
++		size = NUMA_4_NODE_BLOOM_SIZE >> 5;
++	}
+ 	/*
+ 	 * KSM_RUN_MERGE sets ksmd running, and 0 stops it running.
+ 	 * KSM_RUN_UNMERGE stops it running and unmerges all rmap_items,
+@@ -2921,6 +5366,32 @@
+ 	if (flags & KSM_RUN_MERGE)
+ 		wake_up_interruptible(&ksm_thread_wait);
+ 
++	hotness_successful = 0;
++	j = 1;
++	for (i = 0; i < ksm_nr_node_ids; i++) {
++		if (!bitmap[i]) {
++			j &= 0;
++		}
++	}
++	if (j && count == 2) {
++		reset_bitmap(bitmap, size << 5);
++	}
++	if (count == 2) {
++		current_scan_nid = 0;
++		exist_numbers = 0;
++		none_exist_numbers = 0;
++		cold_page_numbers = 0;
++		hot_page_numbers = 0;
++		non_cold_page_numbers = 0;
++		if (ctl_flag != 1 && ctl_flag != 0 && ((ctl_flag & 4) == 0)) {
++			printk("<7>AdaptMD: func:%s set ctl_flag=9\n",
++			       __func__);
++			ctl_flag = 9;
++		}
++	}
++
++	printk("<7>AdaptMD: ksm_run=%d, ctl_flag=%d, active_threshold=%d\n",
++	       (int)count, ctl_flag, active_threshold);
+ 	return count;
+ }
+ KSM_ATTR(run);
+@@ -2976,6 +5447,7 @@
+ 			ksm_nr_node_ids = knob ? 1 : nr_node_ids;
+ 		}
+ 	}
++	global_user_merge_across_nodes = ksm_merge_across_nodes;
+ 	mutex_unlock(&ksm_thread_mutex);
+ 
+ 	return err ? err : count;
+@@ -3072,8 +5544,8 @@
+ {
+ 	long ksm_pages_volatile;
+ 
+-	ksm_pages_volatile = ksm_rmap_items - ksm_pages_shared
+-				- ksm_pages_sharing - ksm_pages_unshared;
++	ksm_pages_volatile = ksm_rmap_items - ksm_pages_shared -
++			     ksm_pages_sharing - ksm_pages_unshared;
+ 	/*
+ 	 * It was not worth any locking to calculate that statistic,
+ 	 * but it might therefore sometimes be negative: conceal that.
+@@ -3100,8 +5572,7 @@
+ 
+ static ssize_t
+ stable_node_chains_prune_millisecs_show(struct kobject *kobj,
+-					struct kobj_attribute *attr,
+-					char *buf)
++					struct kobj_attribute *attr, char *buf)
+ {
+ 	return sprintf(buf, "%u\n", ksm_stable_node_chains_prune_millisecs);
+ }
+@@ -3134,6 +5605,9 @@
+ static struct attribute *ksm_attrs[] = {
+ 	&sleep_millisecs_attr.attr,
+ 	&pages_to_scan_attr.attr,
++	&migrate_vms_interval_attr.attr,
++	&active_threshold_attr.attr,
++	&similarity_threshold_attr.attr,
+ 	&run_attr.attr,
+ 	&pages_shared_attr.attr,
+ 	&pages_sharing_attr.attr,
+@@ -3142,6 +5616,13 @@
+ 	&full_scans_attr.attr,
+ #ifdef CONFIG_NUMA
+ 	&merge_across_nodes_attr.attr,
++	// &node_mem_overload_threshold_attr.attr,
++	&node_cpus_overload_threshold_attr.attr,
++	&use_bloom_filter_attr.attr,
++	&use_one_hash_attr.attr,
++	// &hash_page_contend_attr.attr,
++	&adaptive_interval_attr.attr,
++	&enable_adaptive_dedup_attr.attr,
+ #endif
+ 	&max_page_sharing_attr.attr,
+ 	&stable_node_chains_attr.attr,
+@@ -3173,7 +5654,7 @@
+ 
+ 	ksm_thread = kthread_run(ksm_scan_thread, NULL, "ksmd");
+ 	if (IS_ERR(ksm_thread)) {
+-		pr_err("ksm: creating kthread failed\n");
++		printk(KERN_ERR "ksm: creating kthread failed\n");
+ 		err = PTR_ERR(ksm_thread);
+ 		goto out_free;
+ 	}
+@@ -3181,7 +5662,7 @@
+ #ifdef CONFIG_SYSFS
+ 	err = sysfs_create_group(mm_kobj, &ksm_attr_group);
+ 	if (err) {
+-		pr_err("ksm: register sysfs failed\n");
++		printk(KERN_ERR "ksm: creating kthread failed\n");
+ 		kthread_stop(ksm_thread);
+ 		goto out_free;
+ 	}
