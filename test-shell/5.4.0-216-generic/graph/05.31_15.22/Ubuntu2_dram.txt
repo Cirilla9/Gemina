@@ -1,0 +1,8 @@
+
+ Performance counter stats for process id '4024':
+
+        37,888,946      ocr_reads_to_core_local_dram                                   
+         9,438,683      ocr_reads_to_core_remote_dram                                   
+
+     112.788238361 seconds time elapsed
+

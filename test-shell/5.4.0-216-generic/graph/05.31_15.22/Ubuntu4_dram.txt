@@ -1,0 +1,8 @@
+
+ Performance counter stats for process id '4150':
+
+        27,979,601      ocr_reads_to_core_local_dram                                   
+         3,311,350      ocr_reads_to_core_remote_dram                                   
+
+     111.882226365 seconds time elapsed
+

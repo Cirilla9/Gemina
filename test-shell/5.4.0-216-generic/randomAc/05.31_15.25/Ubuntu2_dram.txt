@@ -1,0 +1,8 @@
+
+ Performance counter stats for process id '7249':
+
+        58,472,332      ocr_reads_to_core_local_dram                                   
+         8,333,374      ocr_reads_to_core_remote_dram                                   
+
+      73.073836405 seconds time elapsed
+

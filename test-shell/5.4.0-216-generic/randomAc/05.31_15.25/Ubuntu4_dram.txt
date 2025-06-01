@@ -1,0 +1,8 @@
+
+ Performance counter stats for process id '7353':
+
+        32,964,077      ocr_reads_to_core_local_dram                                   
+           382,051      ocr_reads_to_core_remote_dram                                   
+
+      72.104124164 seconds time elapsed
+

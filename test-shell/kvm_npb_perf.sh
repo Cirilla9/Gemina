@@ -103,7 +103,7 @@ for vm_name in $vm_list; do
 
     echo "绑定 QEMU 进程 PID: $qemu_pid，开始记录NUMA内存访问..."
     
-    /home/zz/2025data/perf/pmu-tools/ocperf.py stat -e ocr.reads_to_core.local_dram,ocr.reads_to_core.remote_dram \
+    /home/zz/pmu-tools/ocperf.py stat -e ocr.reads_to_core.local_dram,ocr.reads_to_core.remote_dram \
     -p "$qemu_pid" > "${output_directory}/${vm_name}_dram.txt" 2>&1 &
 
     # 记录主进程

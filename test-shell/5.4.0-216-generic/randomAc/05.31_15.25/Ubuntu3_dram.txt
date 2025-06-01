@@ -1,0 +1,8 @@
+
+ Performance counter stats for process id '7298':
+
+        49,772,958      ocr_reads_to_core_local_dram                                   
+         1,751,807      ocr_reads_to_core_remote_dram                                   
+
+      72.589982787 seconds time elapsed
+

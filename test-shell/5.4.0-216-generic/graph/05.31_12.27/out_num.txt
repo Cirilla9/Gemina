@@ -1,0 +1,2 @@
+average_harmonic_mean_TEPS,max_harmonic_mean_TEPS,min_harmonic_mean_TEPS
+92476750,9.27717684778332859e+07,9.18832601765445173e+07

@@ -33,10 +33,18 @@ for vm_name in $vm_list; do
 
     if [[ $vm_status =~ "running" ]]; then
       echo "虚拟机 $vm_name 已经开机，执行强制重启"
-      virsh reset $vm_name
+      virsh destroy $vm_name
+      sleep 10
+      virsh setmaxmem $vm_name 20G
+      virsh start $vm_name
+      sleep 20
+      virsh setmem $vm_name 20G
     else
       echo "启动虚拟机 $vm_name"
+      virsh setmaxmem $vm_name 20G
       virsh start $vm_name
+      sleep 20
+      virsh setmem $vm_name 20G
     fi
   fi
 done
@@ -80,7 +88,7 @@ for vm_name in $vm_list; do
     echo "虚拟机 $vm_name，IP地址为 $vm_ip"
 
     echo "run redis..."
-    ssh zz@$vm_ip 'echo "123456" | sudo -S sh -c "echo never > /sys/kernel/mm/transparent_hugepage/enabled; echo never > /sys/kernel/mm/transparent_hugepage/defrag; sed -i \"s/^disable-thp .*/disable-thp yes/\" /etc/redis/redis.conf; systemctl restart redis-server; echo 0 | sudo tee /proc/sys/kernel/randomize_va_space"'
+    ssh zz@$vm_ip 'echo "123456" | sudo -S sh -c "echo always > /sys/kernel/mm/transparent_hugepage/enabled; echo always > /sys/kernel/mm/transparent_hugepage/defrag; sed -i \"s/^disable-thp .*/disable-thp yes/\" /etc/redis/redis.conf; systemctl restart redis-server; echo 0 | sudo tee /proc/sys/kernel/randomize_va_space"'
     # ssh zz@$vm_ip 'echo "123456" | sudo -S sh -c "echo always > /sys/kernel/mm/transparent_hugepage/enabled; echo always > /sys/kernel/mm/transparent_hugepage/defrag; echo 0 | sudo tee /proc/sys/kernel/randomize_va_space"'
     sleep 5
     # 在宿主机上使用ssh连接到虚拟机，并将负载命令放入后台执行
@@ -96,8 +104,8 @@ for vm_name in $vm_list; do
     fi
 
     echo "绑定 QEMU 进程 PID: $qemu_pid，开始记录NUMA内存访问..."
-    
-    /home/zz/2025data/perf/pmu-tools/ocperf.py stat -e ocr.reads_to_core.local_dram,ocr.reads_to_core.remote_dram \
+
+    /home/zz/pmu-tools/ocperf.py stat -e ocr.reads_to_core.local_dram,ocr.reads_to_core.remote_dram \
     -p "$qemu_pid" > "${output_directory}/${vm_name}_dram.txt" 2>&1 &
 
     # 记录主进程
@@ -132,7 +140,10 @@ for vm_name in $vm_list; do
 
     if [[ $vm_status =~ "running" ]]; then
       echo "run $vm_name over，shut down"
+      virsh setmem $vm_name 8G
       virsh destroy $vm_name
+      sleep 10
+      virsh setmaxmem $vm_name 8G
     fi
   fi
 done

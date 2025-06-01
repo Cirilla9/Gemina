@@ -1,0 +1,8 @@
+
+ Performance counter stats for process id '4085':
+
+        44,672,014      ocr_reads_to_core_local_dram                                   
+         5,548,521      ocr_reads_to_core_remote_dram                                   
+
+     112.336539171 seconds time elapsed
+

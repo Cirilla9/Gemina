@@ -10,7 +10,7 @@ if [ -d "/sys/kernel/mm/ksm" ]; then
   sudo echo 2 >"$mm_directory/run"
   sudo echo 0 >"$mm_directory/run"
   sudo echo 1 >"$mm_directory/run"
-  sudo echo 10001 >"$mm_directory/pages_to_scan"
+  sudo echo 10000 >"$mm_directory/pages_to_scan"
   sudo echo 20 >"$mm_directory/sleep_millisecs"
 elif [ -d "/sys/kernel/mm/uksm" ]; then
   mm_directory="/sys/kernel/mm/uksm"

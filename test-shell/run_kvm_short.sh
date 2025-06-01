@@ -1,0 +1,1 @@
+./kvm_graph_perf.sh && ./kvm_randomac_perf.sh && pkill -f pcm-memory && pkill -f pcm-numa

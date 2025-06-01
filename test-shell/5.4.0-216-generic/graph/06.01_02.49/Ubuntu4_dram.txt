@@ -1,0 +1,9 @@
+
+ Performance counter stats for process id '4298':
+
+       251,636,480      ocr_reads_to_core_local_dram                                   
+       154,716,043      ocr_reads_to_core_remote_dram                                   
+
+     718.065558662 seconds time elapsed
+
+perf stat -e cpu/event=0xb7,umask=0x1,offcore_rsp=0x104000477,name=ocr_reads_to_core_local_dram/,cpu/event=0xb7,umask=0x1,offcore_rsp=0x730000477,name=ocr_reads_to_core_remote_dram/ -p 4298

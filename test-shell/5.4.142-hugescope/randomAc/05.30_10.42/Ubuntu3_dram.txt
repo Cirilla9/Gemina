@@ -1,0 +1,15 @@
+Cannot run perf
+Downloading https://raw.githubusercontent.com/intel/perfmon/main/ICX/events/icelakex_uncore.json to GenuineIntel-6-6A-uncore.json
+perf stat -e cpu/event=0xb7,umask=0x1,offcore_rsp=0x104000477,name=ocr_reads_to_core_local_dram/,cpu/event=0xb7,umask=0x1,offcore_rsp=0x730000477,name=ocr_reads_to_core_remote_dram/ -p 121060
+Traceback (most recent call last):
+  File "/home/zz/pmu-tools/ocperf.py", line 1234, in <module>
+    perf_cmd(cmd)
+  File "/home/zz/pmu-tools/ocperf.py", line 1190, in perf_cmd
+    ret = subprocess.call(cmd)
+  File "/usr/lib/python3.8/subprocess.py", line 340, in call
+    with Popen(*popenargs, **kwargs) as p:
+  File "/usr/lib/python3.8/subprocess.py", line 858, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/usr/lib/python3.8/subprocess.py", line 1704, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: 'perf'

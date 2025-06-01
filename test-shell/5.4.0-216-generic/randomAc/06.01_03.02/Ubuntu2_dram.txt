@@ -1,0 +1,9 @@
+
+ Performance counter stats for process id '15730':
+
+       624,514,642      ocr_reads_to_core_local_dram                                   
+        30,536,315      ocr_reads_to_core_remote_dram                                   
+
+    1020.090979194 seconds time elapsed
+
+perf stat -e cpu/event=0xb7,umask=0x1,offcore_rsp=0x104000477,name=ocr_reads_to_core_local_dram/,cpu/event=0xb7,umask=0x1,offcore_rsp=0x730000477,name=ocr_reads_to_core_remote_dram/ -p 15730
