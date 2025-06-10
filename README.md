@@ -95,3 +95,15 @@ sudo ./run_kvm_short.sh
 如果遇到虚拟机登录密钥的问题，问一下GPT差不多可以解决
 
 跟连服务器的步骤差不多
+
+KSM的测试指标可以看一下论文或者博客
+
+https://pfzuo.github.io/2016/03/16/Memory-Deduplication/
+
+https://github.com/ustcadsl/SmartMD
+
+https://github.com/dolohow/uksm
+
+graph500的性能是harmonic_mean_TEPS越大越好
+
+其他大部分负载性能是运行时间，越小越好
