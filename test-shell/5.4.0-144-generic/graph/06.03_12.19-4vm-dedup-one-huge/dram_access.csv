@@ -1,0 +1,5 @@
+vm_name,local_dram_reads,remote_dram_reads
+Ubuntu1,263774033,5235247
+Ubuntu2,228138941,5284930
+Ubuntu3,205460115,10855428
+Ubuntu4,0,0

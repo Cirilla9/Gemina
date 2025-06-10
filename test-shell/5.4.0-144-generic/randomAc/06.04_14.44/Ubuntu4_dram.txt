@@ -1,0 +1,9 @@
+
+ Performance counter stats for process id '396532':
+
+       648,329,735      ocr_reads_to_core_local_dram                                   
+        14,416,744      ocr_reads_to_core_remote_dram                                   
+
+    1016.091175553 seconds time elapsed
+
+perf stat -e cpu/event=0xb7,umask=0x1,offcore_rsp=0x104000477,name=ocr_reads_to_core_local_dram/,cpu/event=0xb7,umask=0x1,offcore_rsp=0x730000477,name=ocr_reads_to_core_remote_dram/ -p 396532

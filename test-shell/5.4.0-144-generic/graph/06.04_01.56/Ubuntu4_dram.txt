@@ -1,0 +1,9 @@
+
+ Performance counter stats for process id '369979':
+
+       175,230,553      ocr_reads_to_core_local_dram                                   
+         7,843,622      ocr_reads_to_core_remote_dram                                   
+
+     372.033554963 seconds time elapsed
+
+perf stat -e cpu/event=0xb7,umask=0x1,offcore_rsp=0x104000477,name=ocr_reads_to_core_local_dram/,cpu/event=0xb7,umask=0x1,offcore_rsp=0x730000477,name=ocr_reads_to_core_remote_dram/ -p 369979

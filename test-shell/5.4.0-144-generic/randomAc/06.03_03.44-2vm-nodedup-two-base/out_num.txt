@@ -1,0 +1,3 @@
+average_real,max_real,min_real
+558.17,559.86,556.48
+2vm-nodedup-two

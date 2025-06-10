@@ -1,0 +1,2 @@
+average_real,max_real,min_real
+1148.92,1221.12,1076.73

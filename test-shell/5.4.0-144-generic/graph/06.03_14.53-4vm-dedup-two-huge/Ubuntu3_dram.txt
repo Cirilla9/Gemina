@@ -1,0 +1,9 @@
+
+ Performance counter stats for process id '322448':
+
+       136,192,501      ocr_reads_to_core_local_dram                                   
+         9,363,757      ocr_reads_to_core_remote_dram                                   
+
+     373.037167858 seconds time elapsed
+
+perf stat -e cpu/event=0xb7,umask=0x1,offcore_rsp=0x104000477,name=ocr_reads_to_core_local_dram/,cpu/event=0xb7,umask=0x1,offcore_rsp=0x730000477,name=ocr_reads_to_core_remote_dram/ -p 322448

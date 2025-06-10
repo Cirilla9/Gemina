@@ -1,0 +1,3 @@
+average_real,max_real,min_real
+953.298,1002.24,901.09
+4vm-nodedup-one
