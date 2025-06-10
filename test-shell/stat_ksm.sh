@@ -9,8 +9,8 @@ if [ -d "/sys/kernel/mm/ksm" ]; then
   mm_directory="/sys/kernel/mm/ksm"
   sudo echo 2 >"$mm_directory/run"
   sudo echo 0 >"$mm_directory/run"
-  sudo echo 1 >"$mm_directory/run"
-  sudo echo 10000 >"$mm_directory/pages_to_scan"
+  # sudo echo 1 >"$mm_directory/run"
+  # sudo echo 10000 >"$mm_directory/pages_to_scan"
   sudo echo 20 >"$mm_directory/sleep_millisecs"
 elif [ -d "/sys/kernel/mm/uksm" ]; then
   mm_directory="/sys/kernel/mm/uksm"
@@ -27,8 +27,8 @@ sudo echo 1 > /sys/kernel/debug/tracing/tracing_on
 sudo echo > $TRACE_DIR/trace
 
 # 1 > transparent_page
-echo "never" > /sys/kernel/mm/transparent_hugepage/enabled
-echo "never" > /sys/kernel/mm/transparent_hugepage/defrag
+echo "always" > /sys/kernel/mm/transparent_hugepage/enabled
+echo "always" > /sys/kernel/mm/transparent_hugepage/defrag
 
 # 100 > khugepage
 sudo echo 10000 > /sys/kernel/mm/transparent_hugepage/khugepaged/pages_to_scan
